@@ -73,6 +73,15 @@ class SharedMemory {
   // Unregisters previously registered watched memory range.
   void UnwatchMemoryRange(WatchHandle handle);
 
+  // True if every page of the range is still valid (uploaded and not modified
+  // by the CPU since). A watch registered after an upload must check this:
+  // a CPU write between the upload and the registration fires no watch and
+  // leaves the page unprotected, so later writes are not caught either.
+  bool IsRangeValid(uint32_t start, uint32_t length);
+
+  // Guest memory, for debug logging outside the shared memory implementations.
+  memory::Memory& guest_memory() const { return memory_; }
+
   // Checks if the range has been updated, uploads new data if needed and
   // ensures the host GPU memory backing the range are resident. Returns true if
   // the range has been fully updated and is usable.

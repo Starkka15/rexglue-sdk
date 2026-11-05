@@ -31,6 +31,7 @@
 #include <rex/memory/utils.h>
 #include <rex/ui/d3d12/d3d12_presenter.h>
 #include <rex/ui/d3d12/d3d12_util.h>
+#include <rex/ui/renderdoc_api.h>
 
 REXCVAR_DEFINE_BOOL(d3d12_bindless, true, "GPU/D3D12", "Use bindless resources where available")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -48,6 +49,46 @@ REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics::d3d12 {
+
+// Guest-frame RenderDoc captures. RenderDoc's own F12 capture spans host Presents, and the guest
+// frame's command lists are submitted outside that window, so it only catches the final blit.
+// With RenderDoc attached, F11 captures one whole guest frame, from frame open to frame close.
+namespace {
+std::unique_ptr<ui::RenderDocAPI> guest_capture_api;
+bool guest_capture_checked = false;
+bool guest_capture_active = false;
+bool guest_capture_key_was_down = false;
+}  // namespace
+
+static void GuestFrameCaptureBegin(ID3D12Device* device) {
+  if (!guest_capture_checked) {
+    guest_capture_checked = true;
+    guest_capture_api = ui::RenderDocAPI::CreateIfConnected();
+    if (guest_capture_api) {
+      REXGPU_INFO("RenderDoc attached: press F11 to capture one guest frame");
+    }
+  }
+  if (!guest_capture_api) return;
+#if REX_PLATFORM_WIN32
+  bool down = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
+#else
+  bool down = false;
+#endif
+  bool pressed = down && !guest_capture_key_was_down;
+  guest_capture_key_was_down = down;
+  if (pressed && !guest_capture_active) {
+    guest_capture_api->api_1_0_0()->StartFrameCapture(device, nullptr);
+    guest_capture_active = true;
+    REXGPU_INFO("RenderDoc: guest frame capture started");
+  }
+}
+
+static void GuestFrameCaptureEnd(ID3D12Device* device) {
+  if (!guest_capture_active) return;
+  guest_capture_active = false;
+  uint32_t ok = guest_capture_api->api_1_0_0()->EndFrameCapture(device, nullptr);
+  REXGPU_INFO("RenderDoc: guest frame capture ended ({})", ok ? "saved" : "failed");
+}
 
 // Generated with `xb buildshaders`.
 namespace shaders {
@@ -1911,6 +1952,34 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     return;
   }
 
+  // Swap diagnostics: was the frontbuffer the guest swaps written by a resolve
+  // since the previous swap? Logged on change, so black-screen frames show up.
+  {
+    ++swap_diag_swaps_;
+    auto fetch0 = register_file_->GetTextureFetch(0);
+    uint32_t fb_base = uint32_t(fetch0.base_address) << 12;
+    bool covered = false;
+    for (const auto& r : swap_diag_resolves_) {
+      if (fb_base >= r.first && fb_base < r.first + r.second) {
+        covered = true;
+        break;
+      }
+    }
+    if (fb_base != swap_diag_last_base_ || covered != swap_diag_last_covered_) {
+      std::string list;
+      for (const auto& r : swap_diag_resolves_) {
+        list += fmt::format(" {:08X}+{:X}", r.first, r.second);
+      }
+      REXGPU_WARN("swapdiag #{}: fetch0 base {:08X} ptr {:08X} {}x{} fmt {} {} | resolves:{}",
+                  swap_diag_swaps_, fb_base, frontbuffer_ptr, frontbuffer_width,
+                  frontbuffer_height, uint32_t(fetch0.format),
+                  covered ? "RESOLVED" : "NOT-RESOLVED", list);
+      swap_diag_last_base_ = fb_base;
+      swap_diag_last_covered_ = covered;
+    }
+    swap_diag_resolves_.clear();
+  }
+
   // Obtain the actual swap source texture size (resolution-scaled if it's a
   // resolve destination, or not otherwise).
   D3D12_SHADER_RESOURCE_VIEW_DESC swap_texture_srv_desc;
@@ -2879,18 +2948,25 @@ bool D3D12CommandProcessor::IssueCopy() {
   }
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
   if (readback_mode == ReadbackResolveMode::kDisabled) {
-    uint32_t written_address, written_length;
-    return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
-                                         written_address, written_length);
+    uint32_t written_address = 0, written_length = 0;
+    bool ok = render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
+                                            written_address, written_length);
+    if (written_length && swap_diag_resolves_.size() < 256) {
+      swap_diag_resolves_.emplace_back(written_address, written_length);
+    }
+    return ok;
   }
   return IssueCopy_ReadbackResolvePath();
 }
 
 bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
-  uint32_t written_address, written_length;
+  uint32_t written_address = 0, written_length = 0;
   if (!render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_, written_address,
                                      written_length)) {
     return false;
+  }
+  if (written_length && swap_diag_resolves_.size() < 256) {
+    swap_diag_resolves_.emplace_back(written_address, written_length);
   }
 
   if (!written_length) {
@@ -3331,6 +3407,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
 
   if (is_opening_frame) {
     frame_open_ = true;
+    GuestFrameCaptureBegin(GetD3D12Provider().GetDevice());
 
     // Reset bindings that depend on the data stored in the pools.
     std::memset(current_float_constant_map_vertex_, 0, sizeof(current_float_constant_map_vertex_));
@@ -3456,6 +3533,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
       shared_memory_->SetSystemPageBlocksValidWithGpuDataWritten();
     }
     frame_open_ = false;
+    GuestFrameCaptureEnd(GetD3D12Provider().GetDevice());
     // Submission already closed now, so minus 1.
     closed_frame_submissions_[(frame_current_++) % kQueueFrames] = submission_current_ - 1;
 

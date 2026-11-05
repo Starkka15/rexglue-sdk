@@ -10,6 +10,17 @@
  */
 
 #include <algorithm>
+#include <cstdlib>
+#include <string>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 #include <cstring>
 #include <utility>
 
@@ -541,6 +552,14 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
     return false;
   }
   uint32_t virtual_address = HostToGuestVirtual(host_address);
+  {
+    // DotD flicker probe: every write fault on the Bink set-B color buffer, by alias.
+    static const bool probe = std::getenv("REX_WATCH_PROBE") != nullptr;
+    uint32_t phys = GetPhysicalAddress(virtual_address);
+    if (probe && phys >= 0x1D4B0000 && phys < 0x1D4F8000) {
+      REXSYS_INFO("watchprobe AV virt {:08X} phys {:08X} write {}", virtual_address, phys, is_write);
+    }
+  }
   BaseHeap* heap = LookupHeap(virtual_address);
   if (!heap || heap->heap_type() != memory::HeapType::kGuestPhysical) {
     REXSYS_ERROR(
@@ -1354,6 +1373,9 @@ bool BaseHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t alignme
       REXSYS_ERROR("BaseHeap::AllocFixed failed to alloc range from host");
       return false;
     }
+    if (alloc_type == rex::memory::AllocationType::kCommit) {
+      ReapplyWriteWatches(start_page_number, end_page_number);
+    }
   }
 
   // Set page state.
@@ -1516,6 +1538,9 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint32_t 
     if (!result) {
       REXSYS_ERROR("BaseHeap::Alloc failed to alloc range from host");
       return false;
+    }
+    if (alloc_type == rex::memory::AllocationType::kCommit) {
+      ReapplyWriteWatches(start_page_number, end_page_number);
     }
   }
 
@@ -2038,6 +2063,48 @@ bool PhysicalHeap::Release(uint32_t base_address, uint32_t* out_region_size) {
   // thus callback handlers will keep considering this range valid forever.
   uint32_t region_size;
   if (QuerySize(base_address, &region_size)) {
+#ifdef _WIN32
+    // DotD flicker probe: after the Bink set-B color buffer is released, catch whoever still
+    // writes to it through the raw physical mapping (guest views never fault there).
+    static const bool probe = std::getenv("REX_WATCH_PROBE") != nullptr;
+    if (probe && parent_base_address <= 0x1D4B0000 && parent_base_address + region_size > 0x1D4B0000) {
+      static void* trap_page = nullptr;
+      trap_page = memory_->TranslatePhysical(0x1D4B0000);
+      static int hits = 0;
+      AddVectoredExceptionHandler(1, [](PEXCEPTION_POINTERS ep) -> LONG {
+        auto* rec = ep->ExceptionRecord;
+        if (rec->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || rec->NumberParameters < 2) {
+          return EXCEPTION_CONTINUE_SEARCH;
+        }
+        auto addr = reinterpret_cast<uint8_t*>(rec->ExceptionInformation[1]);
+        auto page = static_cast<uint8_t*>(trap_page);
+        if (addr < page || addr >= page + 0x44000) {
+          return EXCEPTION_CONTINUE_SEARCH;
+        }
+        if (hits++ < 4) {
+          void* frames[24] = {};
+          USHORT n = RtlCaptureStackBackTrace(0, 24, frames, nullptr);
+          std::string s;
+          for (USHORT k = 0; k < n; ++k) s += fmt::format(" {:016X}", uintptr_t(frames[k]));
+          REXSYS_INFO("watchprobe TRAP write addr +{:X} rip {:016X} thread {:X} stack{}", size_t(addr - page),
+                      uintptr_t(ep->ContextRecord->Rip), GetCurrentThreadId(), s);
+        }
+        DWORD old;
+        VirtualProtect(page, 0x44000, PAGE_READWRITE, &old);
+        return EXCEPTION_CONTINUE_EXECUTION;
+      });
+      DWORD old = 0;
+      BOOL ok = VirtualProtect(trap_page, 0x44000, PAGE_READONLY, &old);
+      DWORD err = ok ? 0 : GetLastError();
+      MEMORY_BASIC_INFORMATION mbi{};
+      VirtualQuery(trap_page, &mbi, sizeof(mbi));
+      REXSYS_INFO("watchprobe release {:08X}+{:X}, trap armed at host {:016X} ok {} err {} old {:X} "
+                  "now {:X} type {:X} region {:X}, trap hits so far {}, membases v {:016X} p {:016X}",
+                  parent_base_address, region_size, uintptr_t(trap_page), ok, err, old, mbi.Protect,
+                  mbi.Type, mbi.RegionSize, hits, uintptr_t(memory_->virtual_membase()),
+                  uintptr_t(memory_->physical_membase()));
+    }
+#endif
     TriggerCallbacks(std::move(global_lock), base_address, region_size, true, true);
   }
 
@@ -2100,6 +2167,9 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t len
                                                : rex::memory::PageAccess::kReadOnly;
   uint8_t* protect_base = membase_ + heap_base_;
   uint32_t protect_system_page_first = UINT32_MAX;
+  // Host protection of released pages, cached across the region of the last query.
+  int64_t host_query_last_page = -1;
+  rex::memory::PageAccess host_query_access = rex::memory::PageAccess::kNoAccess;
   auto global_lock = global_critical_region_.Acquire();
   for (uint32_t i = system_page_first; i <= system_page_last; ++i) {
     // Check if need to enable callbacks for the page and raise its protection.
@@ -2135,7 +2205,44 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t len
     }
     rex::memory::PageAccess current_page_access =
         ToPageAccess(page_table_[guest_page_number].current_protect);
+    // A released physical page stays writable on the host (see protect_on_release), and games
+    // keep writing to it - Bink in Spyro: Dawn of the Dragon decodes into a freed buffer. The
+    // guest page table says no access there, which used to skip the watch, so those writes never
+    // invalidated the GPU copy and the video showed stale planes. Go by the host access instead.
+    // The host query is only made for pages not watched yet, and its answer is reused for the
+    // rest of the host region it describes, to keep this off the per-draw path.
+    if (current_page_access == rex::memory::PageAccess::kNoAccess && enable_invalidation_notifications &&
+        (page_flags_block.notify_on_invalidation & page_flags_bit) == 0 &&
+        IsReleasedPageHostWritable(guest_page_number)) {
+      if (i > host_query_last_page) {
+        size_t query_length = 0;
+        host_query_access = rex::memory::PageAccess::kNoAccess;
+        uint8_t* query_address = protect_base + size_t(i) * system_page_size_;
+        if (!rex::memory::QueryProtect(query_address, query_length, host_query_access)) {
+          host_query_access = rex::memory::PageAccess::kNoAccess;
+          query_length = system_page_size_;
+        }
+        // RegionSize counts from the queried page (rounded down), so it covers at least this one.
+        host_query_last_page =
+            i + uint32_t(std::max<size_t>(query_length / system_page_size_, 1)) - 1;
+      }
+      if (host_query_access == rex::memory::PageAccess::kReadWrite) {
+        current_page_access = rex::memory::PageAccess::kReadWrite;
+      }
+    }
     bool protect_system_page = false;
+    // DotD flicker probe: what the watch sees for the Bink set-B color pages.
+    {
+      static const bool probe = std::getenv("REX_WATCH_PROBE") != nullptr;
+      uint32_t phys = physical_address_offset + i * system_page_size_ - host_address_offset();
+      if (probe && phys >= 0x1D4B0000 && phys < 0x1D4F8000 && (phys & 0xFFFF) == 0) {
+        REXSYS_INFO("watchprobe heap {:08X} phys {:08X} gpage {} state {:X} prot {:X} access {} notify {}",
+                    heap_base_, phys, guest_page_number,
+                    uint32_t(page_table_[guest_page_number].state),
+                    uint32_t(page_table_[guest_page_number].current_protect), int(current_page_access),
+                    (page_flags_block.notify_on_invalidation & page_flags_bit) != 0);
+      }
+    }
     // Don't do anything with inaccessible pages - don't protect, don't enable
     // callbacks - because real access violations are needed there. And don't
     // enable invalidation notifications for read-only pages for the same
@@ -2289,8 +2396,11 @@ bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> globa
       if (unprotect_page) {
         uint32_t guest_page_number =
             rex::sat_sub(i * system_page_size_, host_address_offset()) >> page_size_shift_;
+        // A watched released page was host-writable when it was watched (EnableAccessCallbacks
+        // only watches those), so give the write access back to it too.
         if (ToPageAccess(page_table_[guest_page_number].current_protect) !=
-            rex::memory::PageAccess::kReadWrite) {
+                rex::memory::PageAccess::kReadWrite &&
+            !IsReleasedPageHostWritable(guest_page_number)) {
           unprotect_page = false;
         }
       }
@@ -2330,11 +2440,38 @@ bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> globa
 }
 
 std::unique_lock<std::recursive_mutex> PhysicalHeap::AcquireHostPageReconcileLock() const {
-  auto lock = BaseHeap::AcquireHostPageReconcileLock();
-  if (!lock.owns_lock() && parent_heap_ && parent_heap_->page_size() < memory_->system_page_size_) {
-    lock = rex::thread::global_critical_region::AcquireDirect();
+  // Always taken on physical heaps: ReapplyWriteWatches reads the watch flags that the GPU
+  // thread updates under this lock, and physical allocations are rare enough for it to be free.
+  return rex::thread::global_critical_region::AcquireDirect();
+}
+
+void PhysicalHeap::ReapplyWriteWatches(uint32_t start_page_number, uint32_t end_page_number) {
+  // Runs under AcquireHostPageReconcileLock (the global critical region).
+  const uint64_t byte_first = (uint64_t(start_page_number) << page_size_shift_) + host_address_offset();
+  const uint64_t byte_last =
+      ((uint64_t(end_page_number) + 1) << page_size_shift_) - 1 + host_address_offset();
+  uint32_t first = uint32_t(byte_first / system_page_size_);
+  uint32_t last = std::min(uint32_t(byte_last / system_page_size_), system_page_count_ - 1);
+  uint8_t* protect_base = membase_ + heap_base_;
+  uint32_t run_first = UINT32_MAX;
+  for (uint32_t i = first; i <= last + 1; ++i) {
+    bool watched = i <= last && IsHostPageWriteWatched(i);
+    if (watched && run_first == UINT32_MAX) {
+      run_first = i;
+    } else if (!watched && run_first != UINT32_MAX) {
+      rex::memory::Protect(protect_base + size_t(run_first) * system_page_size_,
+                           size_t(i - run_first) * system_page_size_,
+                           rex::memory::PageAccess::kReadOnly);
+      run_first = UINT32_MAX;
+    }
   }
-  return lock;
+}
+
+bool PhysicalHeap::IsReleasedPageHostWritable(uint32_t guest_page_number) const {
+  // Mirrors BaseHeap's host access rule for uncommitted physical pages.
+  return guest_page_number < page_table_.size() &&
+         !(page_table_[guest_page_number].state & memory::kMemoryAllocationCommit) &&
+         heap_type_ == memory::HeapType::kGuestPhysical && !REXCVAR_GET(protect_on_release);
 }
 
 bool PhysicalHeap::IsHostPageWriteWatched(uint32_t host_page_number) const {

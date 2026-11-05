@@ -13,6 +13,10 @@
 
 #include <rex/memory/utils.h>
 
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
 #if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP | WINAPI_PARTITION_SYSTEM | \
                             WINAPI_PARTITION_GAMES)
 #define REX_BASE_MEMORY_WIN_USE_DESKTOP_FUNCTIONS
@@ -138,6 +142,36 @@ bool Protect(void* base_address, size_t length, PageAccess access, PageAccess* o
     *out_old_access = PageAccess::kNoAccess;
   }
   DWORD new_protect = ToWin32ProtectFlags(access);
+  {
+    // DotD flicker probe: who makes the Bink set-B color page writable again (E view / physical).
+    static const bool probe = std::getenv("REX_WATCH_PROBE") != nullptr;
+    if (probe && new_protect == PAGE_READWRITE) {
+      auto b = reinterpret_cast<uintptr_t>(base_address);
+      for (uintptr_t t : {uintptr_t(0x1FD4BF000ull), uintptr_t(0x21D4C0000ull)}) {
+        if (t >= b && t < b + length) {
+          static FILE* f = std::fopen("protect_probe.txt", "a");
+          void* frames[20] = {};
+          USHORT n = RtlCaptureStackBackTrace(0, 20, frames, nullptr);
+          HMODULE mod = nullptr;
+          std::fprintf(f, "tick %llu RW %016llX+%llX target %016llX stack", GetTickCount64(),
+                       (unsigned long long)b, (unsigned long long)length, (unsigned long long)t);
+          for (USHORT k = 0; k < n; ++k) {
+            char name[MAX_PATH] = "?";
+            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   reinterpret_cast<LPCSTR>(frames[k]), &mod)) {
+              GetModuleFileNameA(mod, name, MAX_PATH);
+              const char* s = std::strrchr(name, '\\');
+              std::fprintf(f, " %s+%llX", s ? s + 1 : name,
+                           (unsigned long long)(uintptr_t(frames[k]) - uintptr_t(mod)));
+            }
+          }
+          std::fprintf(f, "\n");
+          std::fflush(f);
+        }
+      }
+    }
+  }
 #ifdef REX_BASE_MEMORY_WIN_USE_DESKTOP_FUNCTIONS
   DWORD old_protect = 0;
   BOOL result = VirtualProtect(base_address, length, new_protect, &old_protect);

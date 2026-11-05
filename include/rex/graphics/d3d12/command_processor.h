@@ -366,6 +366,11 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool UpdateBindings(const D3D12Shader* vertex_shader, const D3D12Shader* pixel_shader,
                       ID3D12RootSignature* root_signature, bool shared_memory_is_uav);
   bool IssueCopy_ReadbackResolvePath();
+  // Swap diagnostics: resolve destinations written since the last swap.
+  std::vector<std::pair<uint32_t, uint32_t>> swap_diag_resolves_;
+  uint32_t swap_diag_last_base_ = 0;
+  bool swap_diag_last_covered_ = true;
+  uint64_t swap_diag_swaps_ = 0;
   bool IssueDraw_MemexportReadbackFullPath(uint32_t total_size);
   bool IssueDraw_MemexportReadbackFastPath(uint32_t total_size);
 

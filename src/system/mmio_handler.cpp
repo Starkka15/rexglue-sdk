@@ -21,6 +21,13 @@
 #include <rex/system/mmio_handler.h>
 #include <rex/types.h>
 
+#include <string>
+
+#if REX_PLATFORM_WIN32
+#include <fmt/format.h>
+#include <windows.h>
+#endif
+
 using namespace rex::arch;
 
 namespace rex::runtime {
@@ -416,11 +423,55 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
     }
     // The address is not found within any range, so either a write watch or an
     // actual access violation.
-    if (access_violation_callback_) {
-      return access_violation_callback_(std::move(lock), access_violation_callback_context_,
-                                        fault_host_address, is_write);
+    bool handled = access_violation_callback_ &&
+                   access_violation_callback_(std::move(lock), access_violation_callback_context_,
+                                              fault_host_address, is_write);
+#if REX_PLATFORM_WIN32
+    if (!handled) {
+      // Fatal guest fault: log the host pc as module+offset, then the exe-image addresses
+      // found on the stack (a crude backtrace), for llvm-symbolizer against the game's PDB.
+      auto module_of = [](uint64_t a, char* name, size_t n, uint64_t& base) {
+        HMODULE m = nullptr;
+        if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                reinterpret_cast<LPCSTR>(a), &m)) {
+          return false;
+        }
+        base = reinterpret_cast<uint64_t>(m);
+        DWORD len = GetModuleFileNameA(m, name, DWORD(n));
+        const char* slash = std::strrchr(name, '\\');
+        if (slash) std::memmove(name, slash + 1, std::strlen(slash));
+        return len != 0;
+      };
+      char name[MAX_PATH] = {};
+      uint64_t base = 0;
+      uint64_t pc = ex->pc();
+      if (module_of(pc, name, sizeof(name), base)) {
+        REXLOG_ERROR("fatal guest fault at host pc {}+0x{:X}", name, pc - base);
+      } else {
+        REXLOG_ERROR("fatal guest fault at host pc 0x{:X}", pc);
+      }
+      HMODULE exe = GetModuleHandleA(nullptr);
+      uint64_t exe_base = reinterpret_cast<uint64_t>(exe);
+      auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(
+          exe_base + reinterpret_cast<const IMAGE_DOS_HEADER*>(exe_base)->e_lfanew);
+      uint64_t exe_end = exe_base + nt->OptionalHeader.SizeOfImage;
+      const uint64_t* sp = reinterpret_cast<const uint64_t*>(ex->thread_context()->rsp);
+      std::string trace;
+      int found = 0;
+      for (int i = 0; i < 2048 && found < 24; ++i) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (!VirtualQuery(sp + i, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT) break;
+        uint64_t v = sp[i];
+        if (v > exe_base + 0x1000 && v < exe_end) {
+          trace += fmt::format(" 0x{:X}", v - exe_base);
+          ++found;
+        }
+      }
+      REXLOG_ERROR("fatal guest fault stack (exe offsets):{}", trace);
     }
-    return false;
+#endif
+    return handled;
   }
 
   auto rip = ex->pc();

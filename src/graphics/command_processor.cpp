@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -36,6 +37,13 @@
 #include <rex/system/user_module.h>
 
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
+
+REXCVAR_DEFINE_INT32(gpu_wait_spin_us, 0, "GPU",
+                     "WAIT_REG_MEM: yield-poll this many microseconds before falling back to 1 ms "
+                     "sleeps (0 = sleep right away, as Xenia does)");
+
+REXCVAR_DEFINE_BOOL(fps_log, false, "GPU",
+                    "Log guest swaps per second and frame times once a second (fpslog lines)");
 
 REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
                     "Refresh page-valid state from GPU-written memory at frame end. "
@@ -958,6 +966,34 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   uint32_t frontbuffer_height = reader->ReadAndSwap<uint32_t>();
   reader->AdvanceRead((count - 4) * sizeof(uint32_t));
 
+  if (REXCVAR_GET(fps_log)) {
+    // Once a second: guest swaps per second, average and worst frame time, draws per frame.
+    using clock = std::chrono::steady_clock;
+    static clock::time_point window_start = clock::now(), last = clock::now();
+    static uint32_t frames = 0;
+    static double worst_ms = 0;
+    clock::time_point now = clock::now();
+    double ms = std::chrono::duration<double, std::milli>(now - last).count();
+    last = now;
+    worst_ms = std::max(worst_ms, ms);
+    ++frames;
+    double window = std::chrono::duration<double>(now - window_start).count();
+    if (window >= 1.0) {
+      REXGPU_INFO(
+          "fpslog fps {:.1f} avg_ms {:.2f} worst_ms {:.2f} {}x{} waitregmem sleeps {} total_ms {:.1f} "
+          "spins {} blocked_ms {:.1f} last_poll {:08X}",
+          frames / window, window * 1000.0 / frames, worst_ms, frontbuffer_width, frontbuffer_height,
+          wait_reg_mem_sleeps_, wait_reg_mem_sleep_us_ / 1000.0, wait_reg_mem_spins_,
+          wait_reg_mem_blocked_us_ / 1000.0, wait_reg_mem_last_addr_);
+      wait_reg_mem_sleeps_ = 0;
+      wait_reg_mem_sleep_us_ = 0;
+      wait_reg_mem_spins_ = 0;
+      wait_reg_mem_blocked_us_ = 0;
+      window_start = now;
+      frames = 0;
+      worst_ms = 0;
+    }
+  }
   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
 
   ++counter_;
@@ -990,6 +1026,8 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
   bool is_memory = (wait_info & 0x10) != 0;
 
   bool matched = false;
+  bool spin_started = false;
+  std::chrono::steady_clock::time_point spin_start;
   do {
     uint32_t value = 0;
     if (is_memory) {
@@ -1033,11 +1071,32 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
       // Wait.
       if (wait >= 0x100) {
         PrepareForWait();
+        if (!spin_started) {
+          spin_started = true;
+          spin_start = std::chrono::steady_clock::now();
+        }
         if (!REXCVAR_GET(vsync)) {
           // User wants it fast and dangerous.
           rex::thread::MaybeYield();
+        } else if (REXCVAR_GET(gpu_wait_spin_us) > 0 &&
+                   std::chrono::steady_clock::now() - spin_start <
+                       std::chrono::microseconds(REXCVAR_GET(gpu_wait_spin_us))) {
+          // The value usually arrives within microseconds (a CPU-written fence), while a sleep
+          // costs 1-2 ms per poll. Yield-poll first and only sleep for longer waits.
+          rex::thread::MaybeYield();
+          if (REXCVAR_GET(fps_log)) {
+            wait_reg_mem_spins_++;
+          }
         } else {
+          auto sleep_start = std::chrono::steady_clock::now();
           rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
+          if (REXCVAR_GET(fps_log)) {
+            wait_reg_mem_sleeps_++;
+            wait_reg_mem_sleep_us_ += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                   std::chrono::steady_clock::now() - sleep_start)
+                                                   .count());
+            wait_reg_mem_last_addr_ = poll_reg_addr | (is_memory ? 0x80000000u : 0u);
+          }
         }
         rex::thread::SyncMemory();
         ReturnFromWait();
@@ -1051,6 +1110,11 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
       }
     }
   } while (!matched);
+  if (spin_started && REXCVAR_GET(fps_log)) {
+    wait_reg_mem_blocked_us_ += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                             std::chrono::steady_clock::now() - spin_start)
+                                             .count());
+  }
 
   return true;
 }

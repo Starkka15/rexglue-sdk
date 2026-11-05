@@ -255,6 +255,12 @@ class BaseHeap {
   // Only PhysicalHeap tracks this; every other heap has no watch state.
   virtual bool IsHostPageWriteWatched(uint32_t host_page_number) const { return false; }
 
+  // Called after a host commit of guest pages [start_page_number, end_page_number]. A commit
+  // (VirtualAlloc MEM_COMMIT) resets host protection to the requested access, which silently
+  // drops write watches that SyncHostPageAccess would otherwise keep - and it skips heaps whose
+  // pages are at least host page sized. PhysicalHeap re-protects its watched pages here.
+  virtual void ReapplyWriteWatches(uint32_t start_page_number, uint32_t end_page_number) {}
+
   void Initialize(memory::Memory* memory, uint8_t* membase, HeapType heap_type, uint32_t heap_base,
                   uint32_t heap_size, uint32_t page_size, uint32_t host_address_offset = 0);
 
@@ -324,6 +330,9 @@ class PhysicalHeap : public BaseHeap {
 
  protected:
   bool IsHostPageWriteWatched(uint32_t host_page_number) const override;
+  void ReapplyWriteWatches(uint32_t start_page_number, uint32_t end_page_number) override;
+  // True for a released (uncommitted) guest page that the host still leaves writable.
+  bool IsReleasedPageHostWritable(uint32_t guest_page_number) const;
 
   // Allocation on these heaps delegates to parent_heap_, whose own reconcile
   // pass takes the global critical region. Acquire whenever this heap or its

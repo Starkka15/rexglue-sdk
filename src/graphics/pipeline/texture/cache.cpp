@@ -10,8 +10,20 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
+#include <cstdio>
+#include <string>
 #include <utility>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 
 #include <rex/assert.h>
 #include <rex/chrono/clock.h>
@@ -25,6 +37,7 @@
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/system/xmemory.h>
 
 REXCVAR_DEFINE_INT32(texture_cache_memory_limit_render_to_texture, 24, "GPU",
                      "Texture cache memory limit for render-to-texture (MB)")
@@ -45,6 +58,9 @@ REXCVAR_DEFINE_INT32(texture_cache_memory_limit_soft_lifetime, 30, "GPU",
                      "Soft texture cache memory limit lifetime (seconds)")
     .range(1, 3600);
 
+REXCVAR_DEFINE_BOOL(texture_log_loads, false, "GPU",
+                    "Log every texture upload and every CPU/GPU write that outdates a "
+                    "texture (debugging stale textures)");
 REXCVAR_DEFINE_BOOL(gpu_3d_to_2d_texture, true, "GPU",
                     "Sample problematic 3D textures through 2D-compatible wrappers")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -446,6 +462,65 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
   // not up to date anymore.
   texture.MakeUpToDateAndWatch(global_critical_region_.Acquire());
   texture.LogAction("Loaded");
+  if (REXCVAR_GET(texture_log_loads)) {
+    // Mean and spread of the guest bytes, to tell real image data from blank/neutral memory.
+    const uint8_t* guest =
+        shared_memory().guest_memory().TranslatePhysical<const uint8_t*>(texture_key.base_page << 12);
+    uint32_t n = std::min(texture.GetGuestBaseSize(), UINT32_C(0x40000));
+    uint64_t sum = 0;
+    uint8_t lo = 255, hi = 0;
+    for (uint32_t i = 0; i < n; i += 7) {
+      sum += guest[i];
+      lo = std::min(lo, guest[i]);
+      hi = std::max(hi, guest[i]);
+    }
+    // Raw dumps of the first loads of linear 8-bit planes (video Y/Cr/Cb) for offline viewing.
+    static std::atomic<int> dumped{0};
+    if (texture_key.format == xenos::TextureFormat::k_8 && !texture_key.tiled &&
+        (texture_key.GetHeight() == 720 || texture_key.GetHeight() == 360) && dumped < 24) {
+      int k = dumped++;
+      char name[64];
+      std::snprintf(name, sizeof(name), "texdump_%02d_%08X_%ux%u_p%u.raw", k,
+                    texture_key.base_page << 12, texture_key.GetWidth(), texture_key.GetHeight(),
+                    texture_key.pitch << 5);
+      if (FILE* f = std::fopen(name, "wb")) {
+        std::fwrite(guest, 1, texture.GetGuestBaseSize(), f);
+        std::fclose(f);
+      }
+    }
+    REXGPU_INFO("texlog load {} {}x{} {} base {:08X} size {:X} base={} mips={} mean {} range {}-{} signs {:X}",
+                FormatInfo::Get(texture_key.format)->name, texture_key.GetWidth(),
+                texture_key.GetHeight(), texture_key.tiled ? "tiled" : "linear",
+                texture_key.base_page << 12, texture.GetGuestBaseSize(),
+                int(pending_load.load_base), int(pending_load.load_mips),
+                n ? sum / ((n + 6) / 7) : 0, lo, hi, int(texture_key.signed_separate));
+    // DotD flicker probe: on each video Y load, hash both Bink color-plane sets in guest memory,
+    // to see whether CPU writes reach them without firing a watch.
+    if (texture_key.format == xenos::TextureFormat::k_8 && !texture_key.tiled &&
+        texture_key.GetHeight() == 720) {
+      auto hash = [&](uint32_t a) {
+        const uint8_t* p = shared_memory().guest_memory().TranslatePhysical<const uint8_t*>(a);
+        uint64_t h = 1469598103934665603ull;
+        for (uint32_t i = 0; i < 0x43780; ++i) h = (h ^ p[i]) * 1099511628211ull;
+        return uint32_t(h ^ (h >> 32));
+      };
+      // Host protection of the set-B color page 1D4C0000 in each alias (A, C, E views, physical).
+      std::string prot;
+#ifdef _WIN32
+      uint8_t* vbase = shared_memory().guest_memory().virtual_membase();
+      uint8_t* pbase = shared_memory().guest_memory().physical_membase();
+      for (uint8_t* p : {vbase + 0xA0000000ull + 0x1D4C0000, vbase + 0xC0000000ull + 0x1D4C0000,
+                         vbase + 0xE0000000ull + 0x1D4C0000 - 0x1000, pbase + 0x1D4C0000}) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        VirtualQuery(p, &mbi, sizeof(mbi));
+        prot += fmt::format(" {:X}", mbi.Protect);
+      }
+#endif
+      REXGPU_INFO("texlog chroma Y {:08X} A {:08X} {:08X} B {:08X} {:08X} prot{}",
+                  texture_key.base_page << 12, hash(0x1B9A6000), hash(0x1B184000),
+                  hash(0x1D4F4000), hash(0x1D4B0000), prot);
+    }
+  }
 
   return true;
 }
@@ -751,6 +826,12 @@ void TextureCache::WatchCallback(const std::unique_lock<std::recursive_mutex>& g
                                  void* context, void* data, uint64_t argument,
                                  bool invalidated_by_gpu) {
   Texture& texture = *static_cast<Texture*>(context);
+  if (REXCVAR_GET(texture_log_loads)) {
+    REXGPU_INFO("texlog outdated {} {}x{} base {:08X} {} by_gpu={}",
+                FormatInfo::Get(texture.key().format)->name, texture.key().GetWidth(),
+                texture.key().GetHeight(), texture.key().base_page << 12,
+                argument != 0 ? "mips" : "base", int(invalidated_by_gpu));
+  }
   texture.WatchCallback(global_lock, argument != 0);
   texture.texture_cache().texture_became_outdated_.store(true, std::memory_order_release);
 }

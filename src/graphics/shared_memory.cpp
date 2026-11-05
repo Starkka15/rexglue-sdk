@@ -19,6 +19,10 @@
 #include <rex/graphics/shared_memory.h>
 #include <rex/math.h>
 #include <rex/memory.h>
+#include <rex/cvar.h>
+#include <rex/logging.h>
+
+REXCVAR_DECLARE(bool, texture_log_loads);
 
 namespace rex::graphics {
 
@@ -221,6 +225,31 @@ SharedMemory::WatchHandle SharedMemory::WatchMemoryRange(uint32_t start, uint32_
 void SharedMemory::UnwatchMemoryRange(WatchHandle handle) {
   auto global_lock = global_critical_region_.Acquire();
   UnlinkWatchRange(reinterpret_cast<WatchRange*>(handle));
+}
+
+bool SharedMemory::IsRangeValid(uint32_t start, uint32_t length) {
+  if (length == 0 || start >= kBufferSize) {
+    return true;
+  }
+  length = std::min(length, kBufferSize - start);
+  uint32_t page_first = start >> page_size_log2_;
+  uint32_t page_last = (start + length - 1) >> page_size_log2_;
+  uint32_t block_first = page_first >> 6;
+  uint32_t block_last = page_last >> 6;
+  auto global_lock = global_critical_region_.Acquire();
+  for (uint32_t i = block_first; i <= block_last; ++i) {
+    uint64_t need = UINT64_MAX;
+    if (i == block_first) {
+      need &= ~((uint64_t(1) << (page_first & 63)) - 1);
+    }
+    if (i == block_last && (page_last & 63) != 63) {
+      need &= (uint64_t(1) << ((page_last & 63) + 1)) - 1;
+    }
+    if ((system_page_flags_valid_[i] & need) != need) {
+      return false;
+    }
+  }
+  return true;
 }
 
 void SharedMemory::FireWatches(uint32_t page_first, uint32_t page_last, bool invalidated_by_gpu) {
@@ -465,6 +494,12 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
     return true;
   }
 
+  if (REXCVAR_GET(texture_log_loads)) {
+    for (const auto& r : upload_ranges_) {
+      REXGPU_INFO("texlog upload {:08X}-{:08X}", r.first << page_size_log2_,
+                  ((r.first + r.second) << page_size_log2_) - 1);
+    }
+  }
   return UploadRanges(upload_ranges_);
 }
 
@@ -528,6 +563,11 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
     system_page_flags_valid_and_gpu_written_[i] &= ~invalidate_bits;
   }
 
+  if (REXCVAR_GET(texture_log_loads)) {
+    REXGPU_INFO("texlog fault {:08X}+{:X} exact={} -> invalidate {:08X}-{:08X}",
+                physical_address_start, length, int(exact_range), page_first << page_size_log2_,
+                ((page_last + 1) << page_size_log2_) - 1);
+  }
   FireWatches(page_first, page_last, false);
 
   return std::make_pair(page_first << page_size_log2_, (page_last - page_first + 1)

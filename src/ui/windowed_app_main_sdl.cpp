@@ -32,7 +32,13 @@
 #include <windows.h>
 #include <objbase.h>
 #include <shellapi.h>
+#include <timeapi.h>
+#pragma comment(lib, "winmm.lib")
 #endif
+
+REXCVAR_DEFINE_BOOL(high_res_timer, true, "Core",
+                    "Request 1 ms Windows timer resolution so short sleeps are not 15.6 ms")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace {
 
@@ -49,6 +55,12 @@ int RunWindowedApp(int argc, char** argv) {
     }
 
 #if REX_PLATFORM_WIN32
+    // Without this, Windows rounds every Sleep up to the 15.6 ms system tick. The GPU command
+    // processor sleeps in WAIT_REG_MEM for "1 ms" at a time, so each missed poll cost a whole
+    // tick and starved the guest's command ring (Spyro: Dawn of the Dragon, 40-50 FPS).
+    if (REXCVAR_GET(high_res_timer)) {
+      timeBeginPeriod(1);
+    }
     // Apartment-threaded COM for shell dialogs.
     if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) {
       return EXIT_FAILURE;

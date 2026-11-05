@@ -24,7 +24,11 @@
 #include <rex/memory.h>
 #include <rex/ui/graphics_util.h>
 
-REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu, false, "GPU",
+// true as in Xenia: with false, unclipped full-screen draws are assumed to
+// reach the scissor bottom (up to 8192), so render targets claim EDRAM past
+// their real height and can wrap over others (seen: a 640x1024 4xMSAA depth
+// target wrapping over the frontbuffer source, showing black for seconds).
+REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu, true, "GPU",
                     "Execute unclipped draw vertex shader on CPU");
 
 REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu_with_scissor, false, "GPU",

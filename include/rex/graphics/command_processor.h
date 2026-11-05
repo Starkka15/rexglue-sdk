@@ -281,6 +281,13 @@ class CommandProcessor {
   reg::DC_LUT_30_COLOR gamma_ramp_256_entry_table_[256] = {};
   reg::DC_LUT_PWL_DATA gamma_ramp_pwl_rgb_[128][3] = {};
   uint32_t gamma_ramp_rw_component_ = 0;
+
+  // fps_log statistics: WAIT_REG_MEM sleeps per second and their real duration.
+  uint32_t wait_reg_mem_sleeps_ = 0;
+  uint64_t wait_reg_mem_sleep_us_ = 0;
+  uint32_t wait_reg_mem_last_addr_ = 0;
+  uint32_t wait_reg_mem_spins_ = 0;
+  uint64_t wait_reg_mem_blocked_us_ = 0;
 };
 
 }  // namespace rex::graphics
