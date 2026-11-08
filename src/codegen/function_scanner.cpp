@@ -196,7 +196,8 @@ namespace {
 // Determines how target addresses are stored/computed in the binary
 enum class JumpTableType : u8 {
   kAbsolute,     // lwzx - table contains full 32-bit target addresses
-  kComputed,     // lbzx + rlwinm + add - byte offset shifted and added to base
+  kComputed,     // lbzx/lhzx + rlwinm + add - offset shifted and added to base
+                 // (entry width in load_size/loadSize: 1 = lbzx, 2 = lhzx)
   kByteOffset,   // lbzx + add - byte offset added directly to base
   kShortOffset,  // lhzx + add - 16-bit offset added to base
 };
@@ -210,6 +211,7 @@ struct JumpTableMatch {
   u8 index_reg = 0;       // Register holding original switch index
   u8 offset_reg = 0;      // Register holding loaded offset
   u8 shift_amount = 0;    // Shift amount for COMPUTED type
+  u8 load_size = 1;       // COMPUTED entry width: 1 (lbzx) or 2 (lhzx)
   guest_addr_t table_high = 0;
   guest_addr_t table_low = 0;
   guest_addr_t base_high = 0;
@@ -388,12 +390,20 @@ std::vector<guest_addr_t> read_table_entries(const FunctionScanner& scanner,
       }
 
       case JumpTableType::kComputed: {
-        // Read byte, shift, add to base
-        auto entry_ptr = scanner.translate_address<u8>(table_addr + i);
-        if (!entry_ptr)
-          goto done;
-        u8 offset = *entry_ptr;
-        target = match.base_address() + (static_cast<u32>(offset) << match.shift_amount);
+        // Read byte or halfword (lhzx: zlib's inflate state switch), shift, add to base
+        u32 offset;
+        if (match.load_size == 2) {
+          auto entry_ptr = scanner.translate_address<u16>(table_addr + (i * 2));
+          if (!entry_ptr)
+            goto done;
+          offset = load_and_swap<u16>(entry_ptr);
+        } else {
+          auto entry_ptr = scanner.translate_address<u8>(table_addr + i);
+          if (!entry_ptr)
+            goto done;
+          offset = *entry_ptr;
+        }
+        target = match.base_address() + (offset << match.shift_amount);
         break;
       }
 
@@ -604,7 +614,15 @@ std::optional<JumpTable> FunctionScanner::detect_jump_table(guest_addr_t bctr_ad
 
       // lhzx for SHORTOFFSET
       if (instr.opcode == Opcode::lhzx && instr.X.RT == match.offset_reg) {
-        match.type = JumpTableType::kShortOffset;
+        // A shift found before the load (rlwinm on the loaded offset) means the halfword is
+        // shifted before the add: COMPUTED with 2-byte entries, not plain SHORTOFFSET.
+        // Dropping the shift (or reading bytes) sent zlib inflate's state switch to the
+        // wrong cases, so inflate looped through the gzip header states forever.
+        if (match.found_shift && match.type == JumpTableType::kComputed) {
+          match.load_size = 2;
+        } else {
+          match.type = JumpTableType::kShortOffset;
+        }
         match.table_reg = instr.X.RA;
         match.index_reg = instr.X.RB;
         match.found_load = true;
@@ -1396,6 +1414,7 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
   uint8_t indexReg = 0xFF;       // Current reg being traced (0xFF = stop tracing)
   uint8_t finalIndexReg = 0xFF;  // Last valid indexReg for scanForBounds/output
   int shiftAmount = 0;
+  int loadSize = 1;  // kComputed entry width: 1 (lbzx) or 2 (lhzx)
 
   // Backward scan from bctr
   uint32_t scanAddr = bctrAddr;
@@ -1457,6 +1476,7 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
         if (tableType != JumpTableType::kComputed) {
           tableType = JumpTableType::kShortOffset;
         }
+        loadSize = 2;
         indexReg = insn->X.RB;
         finalIndexReg = indexReg;
         foundLoad = true;
@@ -1719,10 +1739,21 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
         break;
       }
       case JumpTableType::kComputed: {
-        auto val = decoded.read<uint8_t>(tableAddr + i);
-        if (!val)
-          break;
-        target = baseAddr + (static_cast<uint32_t>(*val) << shiftAmount);
+        // Halfword entries (lhzx, e.g. zlib inflate's state switch) are shifted too; reading
+        // them as bytes put the high byte in even cases and the low byte in odd ones.
+        uint32_t entry = 0;
+        if (loadSize == 2) {
+          auto val = decoded.read<uint16_t>(tableAddr + i * 2);
+          if (!val)
+            break;
+          entry = *val;
+        } else {
+          auto val = decoded.read<uint8_t>(tableAddr + i);
+          if (!val)
+            break;
+          entry = *val;
+        }
+        target = baseAddr + (entry << shiftAmount);
         break;
       }
       case JumpTableType::kShortOffset: {

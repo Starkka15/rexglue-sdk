@@ -10,6 +10,8 @@
 */
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstring>
 
 #include <rex/audio/xma/context.h>
@@ -127,24 +129,99 @@ bool XmaContext::Work() {
   const int32_t minimum_subframe_decode_count =
       static_cast<int32_t>(effective_sdc) + data.output_buffer_padding;
 
-  if (minimum_subframe_decode_count > remaining_subframe_blocks_in_output_buffer_) {
-    StoreContextMerged(data, initial_data, context_ptr);
-    return true;
-  }
-
   while (remaining_subframe_blocks_in_output_buffer_ >= minimum_subframe_decode_count) {
     Decode(&data);
     Consume(&output_rb, &data);
 
-    if (!data.IsAnyInputBufferValid() || data.error_status == 4) {
+    // Keep going after the input runs out until the flushed final block has been written.
+    if ((!data.IsAnyInputBufferValid() && !carry_valid_ &&
+         current_frame_remaining_subframes_ == 0) ||
+        data.error_status == 4) {
       break;
     }
   }
 
   data.output_buffer_write_offset = output_rb.write_offset() / kOutputBytesPerBlock;
 
+  // write == read after writing means the ring is full: the decoder stops and drops
+  // output_buffer_valid, which is the game's cue to drain the ring and re-arm it.
   if (output_rb.empty()) {
     data.output_buffer_valid = 0;
+  }
+
+  // Starved input (as xenia-canary's XmaContextNew::Work): the decoder stops, the write offset
+  // is pulled back to the read offset and output_buffer_valid is dropped. Wwise ends a voice
+  // when it sees that "stopped and empty" state; it does not drain what is left first.
+  // Without it every non-looping XMA voice in Skylanders hung once its input ran out: voices
+  // were never freed, the dialogue VO slot stayed taken, later lines were silent and the scene
+  // waited forever. The discarded tail is the last few output blocks of the wave.
+  bool input_done = false;
+  if (!data.IsAnyInputBufferValid() && data.error_status != 4) {
+    input_done = true;
+    current_frame_remaining_subframes_ = 0;
+    carry_valid_ = false;
+    data.output_buffer_write_offset = data.output_buffer_read_offset;
+    data.output_buffer_valid = 0;
+  }
+
+  // Diagnostic (Skylanders VO): decode activity per second, and contexts that stop on an error.
+  {
+    static std::atomic<uint32_t> works{0}, errors{0};
+    static std::atomic<int64_t> window_start{0};
+    static std::atomic<uint32_t> distinct_mask_lo{0}, distinct_mask_hi{0};
+    works++;
+    uint32_t id = static_cast<uint32_t>(id_);
+    if (id < 32) distinct_mask_lo |= 1u << id; else if (id < 64) distinct_mask_hi |= 1u << (id - 32);
+    if (data.error_status) {
+      if (errors.fetch_add(1) < 40) {
+        REXAPU_WARN("xmadiag: context {} error_status {} input0 valid {} len {} input1 valid {} len {} read_offset {:#x}",
+                    id, (uint32_t)data.error_status, (uint32_t)data.input_buffer_0_valid,
+                    (uint32_t)data.input_buffer_0_packet_count, (uint32_t)data.input_buffer_1_valid,
+                    (uint32_t)data.input_buffer_1_packet_count, (uint32_t)data.input_buffer_read_offset);
+      }
+    }
+    int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now().time_since_epoch()).count();
+    int64_t start = window_start.load();
+    if (now - start >= 1000 && window_start.compare_exchange_strong(start, now)) {
+      REXAPU_INFO("xmadiag: {} works/s, contexts {:08X}{:08X}, errors so far {}", works.exchange(0),
+                  distinct_mask_hi.exchange(0), distinct_mask_lo.exchange(0), errors.load());
+    }
+  }
+
+  // Diagnostic (Skylanders VO): log input/output validity transitions per context.
+  {
+    static std::atomic<int> lines{0};
+    const bool changed = initial_data.input_buffer_0_valid != data.input_buffer_0_valid ||
+                         initial_data.input_buffer_1_valid != data.input_buffer_1_valid ||
+                         initial_data.output_buffer_valid != data.output_buffer_valid ||
+                         initial_data.current_buffer != data.current_buffer;
+    static std::atomic<int> work_lines{0};
+    if (!changed && !data.is_stereo && work_lines.fetch_add(1) < 30000) {
+      REXAPU_INFO("xmawork: ctx {} r {} w {}->{} rd {:#x}->{:#x} rem {} carry {}",
+                  static_cast<uint32_t>(id_), (uint32_t)data.output_buffer_read_offset,
+                  (uint32_t)initial_data.output_buffer_write_offset,
+                  (uint32_t)data.output_buffer_write_offset,
+                  (uint32_t)initial_data.input_buffer_read_offset,
+                  (uint32_t)data.input_buffer_read_offset,
+                  (uint32_t)current_frame_remaining_subframes_, carry_valid_);
+    }
+    if (changed && lines.fetch_add(1) < 6000) {
+      REXAPU_INFO(
+          "xmastate: ctx {} in0 {}->{} ({}pk @{:08X}) in1 {}->{} ({}pk @{:08X}) cur {}->{} rd {:#x}->{:#x} "
+          "out {}->{} r {} w {}/{} st {} loop {} sdc {} err {}{}",
+          static_cast<uint32_t>(id_), (uint32_t)initial_data.input_buffer_0_valid,
+          (uint32_t)data.input_buffer_0_valid, (uint32_t)data.input_buffer_0_packet_count,
+          (uint32_t)data.input_buffer_0_ptr, (uint32_t)initial_data.input_buffer_1_valid,
+          (uint32_t)data.input_buffer_1_valid, (uint32_t)data.input_buffer_1_packet_count,
+          (uint32_t)data.input_buffer_1_ptr, (uint32_t)initial_data.current_buffer,
+          (uint32_t)data.current_buffer, (uint32_t)initial_data.input_buffer_read_offset,
+          (uint32_t)data.input_buffer_read_offset, (uint32_t)initial_data.output_buffer_valid,
+          (uint32_t)data.output_buffer_valid, (uint32_t)data.output_buffer_read_offset,
+          (uint32_t)data.output_buffer_write_offset, (uint32_t)data.output_buffer_block_count,
+          (uint32_t)data.is_stereo, (uint32_t)data.loop_count, (uint32_t)data.subframe_decode_count,
+          (uint32_t)data.error_status, input_done ? " [input done]" : "");
+    }
   }
 
   StoreContextMerged(data, initial_data, context_ptr);
@@ -528,11 +605,29 @@ bool XmaContext::DecodePacket(AVCodecContext* av_context, const AVPacket* av_pac
 void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
   SCOPE_profile_cpu_f("apu");
 
-  if (!data->IsAnyInputBufferValid()) {
+  if (current_frame_remaining_subframes_ > 0) {
     return;
   }
 
-  if (current_frame_remaining_subframes_ > 0) {
+  if (!data->IsAnyInputBufferValid()) {
+    // End of the submitted input: the last decoded block's tail is still held in carry_frame_
+    // waiting for a next block's head that will not come. Emit it (head padded with silence) so
+    // the stream's full sample count reaches the output. Without this every wave comes out one
+    // frame short, and Wwise, which waits for the header's sample count, never ends the voice
+    // (Skylanders: streamed VO slots never freed, later lines silent, dialog stuck).
+    if (carry_valid_) {
+      const size_t pad_bytes = kDecoderStartPadding * kBytesPerSample << data->is_stereo;
+      const size_t carry_bytes = (kBytesPerFrameChannel << data->is_stereo) - pad_bytes;
+      std::memcpy(raw_frame_.data(), carry_frame_.data(), carry_bytes);
+      std::memset(raw_frame_.data() + carry_bytes, 0, pad_bytes);
+      current_frame_remaining_subframes_ = 4 << data->is_stereo;
+      loop_frame_output_limit_ = pending_output_limit_;
+      current_frame_remaining_subframes_ -=
+          std::min(pending_start_skip_, current_frame_remaining_subframes_);
+      pending_output_limit_ = 0;
+      pending_start_skip_ = 0;
+      carry_valid_ = false;
+    }
     return;
   }
 

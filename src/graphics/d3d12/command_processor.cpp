@@ -10,8 +10,15 @@
  */
 
 #include <algorithm>
+#include <array>
+#include <chrono>
+#include <mutex>
+#include <set>
 #include <cstdarg>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <sstream>
 #include <utility>
 
@@ -2355,6 +2362,88 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
 
   bool surface_pitch_is_zero = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 0;
 
+  // Diagnostic (Skylanders shadow square): every distinct draw into the 256-wide 4x MSAA
+  // surface that holds Spyro's projected shadow mask.
+  {
+    auto surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+    if (surface_info.msaa_samples == xenos::MsaaSamples::k4X) {
+      static std::mutex mdiag_mutex;
+      static std::set<std::array<uint64_t, 6>> mdiag_seen;
+      std::lock_guard<std::mutex> mdiag_lock(mdiag_mutex);
+      auto* vs = active_vertex_shader();
+      auto* ps = active_pixel_shader();
+      uint64_t vs_hash = vs ? vs->ucode_data_hash() : 0;
+      uint64_t ps_hash = ps ? ps->ucode_data_hash() : 0;
+      uint32_t color_info0 = regs[XE_GPU_REG_RB_COLOR_INFO];
+      uint32_t color_mask = regs[XE_GPU_REG_RB_COLOR_MASK];
+      uint32_t depth_control = regs[XE_GPU_REG_RB_DEPTHCONTROL];
+      uint32_t blend0 = regs[XE_GPU_REG_RB_BLENDCONTROL0];
+      uint32_t color_control = regs[XE_GPU_REG_RB_COLORCONTROL];
+      uint32_t mode_cntl = regs[XE_GPU_REG_PA_SU_SC_MODE_CNTL];
+      std::array<uint64_t, 6> sig = {vs_hash, ps_hash,
+                                     (uint64_t(color_info0) << 32) | color_mask,
+                                     (uint64_t(depth_control) << 32) | blend0,
+                                     (uint64_t(color_control) << 32) | mode_cntl,
+                                     (uint64_t(uint32_t(primitive_type)) << 32) |
+                                         uint32_t(edram_mode)};
+      if (mdiag_seen.size() < 300 && mdiag_seen.insert(sig).second) {
+        REXGPU_INFO(
+            "mdiag: pitch {} swap {} prim {} count {} edram {} vs {:016X} ps {:016X} color_info {:08X} "
+            "mask {:08X} depth_info {:08X} depthctl {:08X} blend0 {:08X} colorctl {:08X} "
+            "modecntl {:08X} scissor {:08X}-{:08X} window_off {:08X} vte {:08X} "
+            "vp sx {} ox {} sy {} oy {} sz {} oz {} alpha_ref {} clip {:08X}",
+            uint32_t(surface_info.surface_pitch), swap_diag_swaps_, uint32_t(primitive_type),
+            index_count, uint32_t(edram_mode), vs_hash,
+            ps_hash, color_info0, color_mask, regs[XE_GPU_REG_RB_DEPTH_INFO], depth_control, blend0,
+            color_control, mode_cntl, regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL],
+            regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR], regs[XE_GPU_REG_PA_SC_WINDOW_OFFSET],
+            regs[XE_GPU_REG_PA_CL_VTE_CNTL], regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE),
+            regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XOFFSET),
+            regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE),
+            regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YOFFSET),
+            regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZSCALE),
+            regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZOFFSET),
+            regs.Get<float>(XE_GPU_REG_RB_ALPHA_REF), regs[XE_GPU_REG_PA_CL_CLIP_CNTL]);
+        if (surface_info.surface_pitch == 280) {
+          std::string fetches;
+          for (uint32_t t = 0; t < 4; ++t) {
+            auto f = regs.GetTextureFetch(t);
+            fetches += fmt::format(" t{}:{:08X} fmt {} {}x{} sw {:03o} clamp {}{} border {} sign {}{}{}{} |",
+                                   t, uint32_t(f.base_address) << 12, uint32_t(f.format),
+                                   uint32_t(f.size_2d.width) + 1, uint32_t(f.size_2d.height) + 1,
+                                   uint32_t(f.swizzle), uint32_t(f.clamp_x), uint32_t(f.clamp_y),
+                                   uint32_t(f.border_color), uint32_t(f.sign_x),
+                                   uint32_t(f.sign_y), uint32_t(f.sign_z), uint32_t(f.sign_w));
+          }
+          std::string consts;
+          for (uint32_t c = 0; c < 6; ++c) {
+            uint32_t r = XE_GPU_REG_SHADER_CONSTANT_256_X + c * 4;
+            consts += fmt::format(" c{}=({:g},{:g},{:g},{:g})", c, regs.Get<float>(r),
+                                  regs.Get<float>(r + 1), regs.Get<float>(r + 2),
+                                  regs.Get<float>(r + 3));
+          }
+          REXGPU_INFO("mdiag280:{} ps consts{}", fetches, consts);
+          if (ps_hash == 0xA4A965C189287B99ull) {
+            auto vf = regs.GetVertexFetch(95);
+            uint32_t addr = uint32_t(vf.address) << 2;
+            const uint32_t* words =
+                reinterpret_cast<const uint32_t*>(memory_->TranslatePhysical(addr));
+            std::string verts;
+            for (uint32_t i = 0; words && i < 21 && i < vf.size; ++i) {
+              // Guest memory is big-endian; k8in32 float data reads with one byte swap.
+              uint32_t w = _byteswap_ulong(words[i]);
+              float fv;
+              std::memcpy(&fv, &w, 4);
+              verts += fmt::format(" {:g}", fv);
+            }
+            REXGPU_INFO("mdiagclear: vf95 type {} addr {:08X} endian {} size {} data{}",
+                        uint32_t(vf.type), addr, uint32_t(vf.endian), uint32_t(vf.size), verts);
+          }
+        }
+      }
+    }
+  }
+
   // Vertex shader analysis.
   auto vertex_shader = static_cast<D3D12Shader*>(active_vertex_shader());
   if (!vertex_shader) {
@@ -2393,6 +2482,176 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       return true;
     }
   }
+  // Diagnostic (Skylanders shadow square): dump the microcode of the shadow mask's shaders.
+  if (regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 280 &&
+      regs.Get<reg::RB_SURFACE_INFO>().msaa_samples == xenos::MsaaSamples::k4X) {
+    static std::mutex udump_mutex;
+    static std::set<uint64_t> udump_seen;
+    std::lock_guard<std::mutex> udump_lock(udump_mutex);
+    if (udump_seen.insert(vertex_shader->ucode_data_hash()).second) {
+      vertex_shader->DumpUcode("H:\\skylanders-sa\\logs\\shaders");
+    }
+    auto* ps_any = static_cast<D3D12Shader*>(active_pixel_shader());
+    if (ps_any && udump_seen.insert(ps_any->ucode_data_hash()).second) {
+      pipeline_cache_->AnalyzeShaderUcode(*ps_any);
+      ps_any->DumpUcode("H:\\skylanders-sa\\logs\\shaders");
+    }
+  }
+
+  // Diagnostic (Skylanders shadow square): dump every pixel shader drawn while a shadow map or
+  // the 256x256 mask is bound, with its bindings, so the ground's shadow logic can be read.
+  if (pixel_shader) {
+    std::string bound;
+    for (uint32_t t = 0; t < 16; ++t) {
+      auto f = regs.GetTextureFetch(t);
+      uint32_t base = uint32_t(f.base_address) << 12;
+      if (base == 0x1A960000 || base == 0x1AD60000 || base == 0x1A4F0000 ||
+          base == 0x19870000 || base == 0x1A7B0000 || base == 0x1A8F0000 ||
+          base == 0x1A880000) {
+        bound += fmt::format(" tf{}={:08X}/clamp{}{}/sw{:03o}", t, base, uint32_t(f.clamp_x),
+                             uint32_t(f.clamp_y), uint32_t(f.swizzle));
+      }
+    }
+    if (!bound.empty()) {
+      static std::mutex gdump_mutex;
+      static std::set<uint64_t> gdump_seen;
+      std::lock_guard<std::mutex> gdump_lock(gdump_mutex);
+      if (gdump_seen.size() < 200 && gdump_seen.insert(pixel_shader->ucode_data_hash()).second) {
+        pixel_shader->DumpUcode("H:\\skylanders-sa\\logs\\shaders");
+        vertex_shader->DumpUcode("H:\\skylanders-sa\\logs\\shaders");
+        std::string all;
+        for (uint32_t t = 0; t < 8; ++t) {
+          auto f = regs.GetTextureFetch(t);
+          all += fmt::format(" t{}={:08X}/fmt{}/{}x{}/sw{:03o}/clamp{}{}", t,
+                             uint32_t(f.base_address) << 12, uint32_t(f.format),
+                             uint32_t(f.size_2d.width) + 1, uint32_t(f.size_2d.height) + 1,
+                             uint32_t(f.swizzle), uint32_t(f.clamp_x), uint32_t(f.clamp_y));
+        }
+        // Bool constants 128..159 (pixel shader b128+) live in SHADER_CONSTANT_BOOL_128_159.
+        REXGPU_INFO("gdump: ps {:016X} vs {:016X} pitch {} msaa {} prim {} count {}{} | bools "
+                    "{:08X} {:08X} | all{}",
+                    pixel_shader->ucode_data_hash(), vertex_shader->ucode_data_hash(),
+                    uint32_t(regs.Get<reg::RB_SURFACE_INFO>().surface_pitch),
+                    1u << uint32_t(regs.Get<reg::RB_SURFACE_INFO>().msaa_samples),
+                    uint32_t(primitive_type), index_count, bound,
+                    regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + 4],
+                    regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + 5], all);
+      }
+    }
+  }
+
+  // Diagnostic (Skylanders shadow square): with SKY_RDUMP, every 5 s log the cascade constants
+  // of one draw that samples both shadow maps (near c8-c11, far c12-c15, fades c72, vertex
+  // constants c0-c7 for the camera), next to the shadow-map dumps.
+  if (pixel_shader && std::getenv("SKY_RDUMP")) {
+    bool has_near = false, has_far = false;
+    for (uint32_t t = 0; t < 16; ++t) {
+      uint32_t base = uint32_t(regs.GetTextureFetch(t).base_address) << 12;
+      has_near |= base == 0x1AD60000;
+      has_far |= base == 0x1A960000;
+    }
+    static std::atomic<int64_t> cdump_last{0};
+    int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                      std::chrono::steady_clock::now().time_since_epoch())
+                      .count();
+    int64_t last = cdump_last.load();
+    if (has_near && has_far && now - last >= 5 && cdump_last.compare_exchange_strong(last, now)) {
+      auto pc = [&](uint32_t i) {
+        uint32_t r = XE_GPU_REG_SHADER_CONSTANT_256_X + i * 4;
+        return fmt::format("c{}=({:g},{:g},{:g},{:g})", i, regs.Get<float>(r),
+                           regs.Get<float>(r + 1), regs.Get<float>(r + 2), regs.Get<float>(r + 3));
+      };
+      std::string text;
+      for (uint32_t i : {8u, 9u, 10u, 11u, 12u, 13u, 14u, 15u, 72u, 7u}) {
+        text += " " + pc(i);
+      }
+      REXGPU_INFO("cdump t={} ps {:016X} pitch {}:{}", now, pixel_shader->ucode_data_hash(),
+                  uint32_t(regs.Get<reg::RB_SURFACE_INFO>().surface_pitch), text);
+    }
+  }
+
+  // Diagnostic (Skylanders shadow square): the shadow-lighting tiles are 770 point sprites
+  // (35x22 tiles of 32x32) and the vertex shader keeps a tile only if its byte in vf0 matches
+  // the variant. Every 5 s log vf0 and its bytes as a 35-wide grid, in guest byte order.
+  {
+    uint64_t vs_hash = vertex_shader->ucode_data_hash();
+    if (vs_hash == 0xB0AF95CED0F6E891ull || vs_hash == 0xEF325E2FB945E1D5ull ||
+        vs_hash == 0x8EE2B495365D294Aull || vs_hash == 0x9BA2B4CB0584D5DDull) {
+      static std::atomic<int64_t> tdump_last{0};
+      int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+      int64_t last = tdump_last.load();
+      if (now - last >= 5 && tdump_last.compare_exchange_strong(last, now)) {
+        uint32_t vf_index = 0;
+        if (!vertex_shader->vertex_bindings().empty()) {
+          vf_index = vertex_shader->vertex_bindings()[0].fetch_constant;
+        }
+        auto vf = regs.GetVertexFetch(vf_index);
+        REXGPU_INFO("tdump binding fetch constant {}", vf_index);
+        uint32_t addr = uint32_t(vf.address) << 2;
+        const uint8_t* bytes = memory_->TranslatePhysical(addr);
+        auto vc = [&](uint32_t i) {
+          uint32_t r = XE_GPU_REG_SHADER_CONSTANT_000_X + i * 4;
+          return fmt::format("c{}=({:g},{:g},{:g},{:g})", i, regs.Get<float>(r),
+                             regs.Get<float>(r + 1), regs.Get<float>(r + 2),
+                             regs.Get<float>(r + 3));
+        };
+        REXGPU_INFO("tdump vs {:016X} ps {:016X}: vf0 {:08X} {:08X} type {} addr {:08X} endian {} "
+                    "size {} | {} {} {} {} {}",
+                    vs_hash, pixel_shader ? pixel_shader->ucode_data_hash() : 0, vf.dword_0,
+                    vf.dword_1, uint32_t(vf.type), addr, uint32_t(vf.endian), uint32_t(vf.size),
+                    vc(32), vc(33), vc(253), vc(254), vc(255));
+        for (uint32_t row = 0; bytes && row < 22; ++row) {
+          std::string line;
+          for (uint32_t col = 0; col < 35; ++col) {
+            uint32_t tile = row * 35 + col;
+            // c33 = (385, 15): the second half of the tiles starts 15 bytes later.
+            uint32_t i = tile + (tile >= 385 ? 15 : 0);
+            if (i >= vf.size * 4u) {
+              break;
+            }
+            line += fmt::format("{:02X} ", bytes[i]);
+          }
+          REXGPU_INFO("tdump row {:2}: {}", row, line);
+        }
+      }
+    }
+  }
+
+  // Diagnostic (Skylanders shadow square): SKY_SKIP_PS=<hash>,<hash>... skips draws whose pixel
+  // shader ucode hash is listed, to find which pass draws the dark block.
+  if (pixel_shader) {
+    static const std::vector<uint64_t> sky_skip_ps = [] {
+      std::vector<uint64_t> list;
+      if (const char* env = std::getenv("SKY_SKIP_PS")) {
+        std::string s(env);
+        size_t pos = 0;
+        while (pos < s.size()) {
+          size_t comma = s.find(',', pos);
+          std::string item = s.substr(pos, comma == std::string::npos ? std::string::npos
+                                                                      : comma - pos);
+          if (!item.empty()) {
+            list.push_back(std::strtoull(item.c_str(), nullptr, 16));
+          }
+          if (comma == std::string::npos) {
+            break;
+          }
+          pos = comma + 1;
+        }
+      }
+      return list;
+    }();
+    if (!sky_skip_ps.empty()) {
+      uint64_t hash = pixel_shader->ucode_data_hash();
+      for (uint64_t skip : sky_skip_ps) {
+        if (skip == hash) {
+          return true;
+        }
+      }
+    }
+  }
+
   bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
   bool memexport_used = memexport_used_vertex || memexport_used_pixel;
 
@@ -2947,12 +3206,75 @@ bool D3D12CommandProcessor::IssueCopy() {
     return false;
   }
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
-  if (readback_mode == ReadbackResolveMode::kDisabled) {
+  static bool mode_logged = false;
+  if (!mode_logged) {
+    mode_logged = true;
+    REXGPU_WARN("rbdiag: readback mode {} (readback_resolve cvar \"{}\")", int(readback_mode),
+                std::string(REXCVAR_GET(readback_resolve)));
+  }
+  if (readback_mode == ReadbackResolveMode::kDisabled && !HasReadbackResolveAddresses()) {
     uint32_t written_address = 0, written_length = 0;
     bool ok = render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
                                             written_address, written_length);
     if (written_length && swap_diag_resolves_.size() < 256) {
       swap_diag_resolves_.emplace_back(written_address, written_length);
+    }
+    // Diagnostic (Skylanders shadow square): with SKY_RDUMP set, every 5 s dump the 4 MiB
+    // resolves (the 1024x1024 shadow maps) from the GPU copy of guest memory to
+    // H:\skylanders-sa\logs\dumps\<seconds>_<address>.bin.
+    static const bool rdump_enabled = std::getenv("SKY_RDUMP") != nullptr;
+    if (ok && rdump_enabled &&
+        (written_length == 1024 * 1024 * 4 || written_address == 0x1A4F0000 ||
+         written_address == 0x1A7B0000 || written_address == 0x1A8F0000 ||
+         written_address == 0x1A880000)) {
+      static auto rdump_start = std::chrono::steady_clock::now();
+      static int64_t rdump_window = -1;
+      static int rdump_in_window = 0;
+      int64_t seconds = std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::steady_clock::now() - rdump_start)
+                            .count();
+      int64_t window = seconds / 5;
+      if (window != rdump_window) {
+        rdump_window = window;
+        rdump_in_window = 0;
+      }
+      if (rdump_in_window < 10) {
+        ++rdump_in_window;
+        ID3D12Device* device = GetD3D12Provider().GetDevice();
+        D3D12_RESOURCE_DESC buffer_desc;
+        ui::d3d12::util::FillBufferResourceDesc(buffer_desc, written_length,
+                                                D3D12_RESOURCE_FLAG_NONE);
+        Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
+        if (SUCCEEDED(device->CreateCommittedResource(
+                &ui::d3d12::util::kHeapPropertiesReadback, D3D12_HEAP_FLAG_NONE, &buffer_desc,
+                D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&buffer)))) {
+          shared_memory_->UseAsCopySource();
+          SubmitBarriers();
+          deferred_command_list_.D3DCopyBufferRegion(buffer.Get(), 0, shared_memory_->GetBuffer(),
+                                                     written_address, written_length);
+          void* mapped = nullptr;
+          D3D12_RANGE read_range = {0, written_length};
+          if (AwaitAllQueueOperationsCompletion() &&
+              SUCCEEDED(buffer->Map(0, &read_range, &mapped))) {
+            auto copy_dest_info = register_file_->Get<reg::RB_COPY_DEST_INFO>();
+            auto copy_dest_pitch = register_file_->Get<reg::RB_COPY_DEST_PITCH>();
+            std::filesystem::create_directories("H:\\skylanders-sa\\logs\\dumps");
+            std::string path = fmt::format("H:\\skylanders-sa\\logs\\dumps\\{:04}_{:08X}_{}.bin",
+                                           seconds, written_address, rdump_in_window);
+            if (FILE* f = std::fopen(path.c_str(), "wb")) {
+              std::fwrite(mapped, 1, written_length, f);
+              std::fclose(f);
+            }
+            REXGPU_INFO("rdump: {} endian {} format {} pitch {} height {} swaps {}", path,
+                        uint32_t(copy_dest_info.copy_dest_endian),
+                        uint32_t(copy_dest_info.copy_dest_format),
+                        uint32_t(copy_dest_pitch.copy_dest_pitch),
+                        uint32_t(copy_dest_pitch.copy_dest_height), swap_diag_swaps_);
+            D3D12_RANGE written_range = {0, 0};
+            buffer->Unmap(0, &written_range);
+          }
+        }
+      }
     }
     return ok;
   }
@@ -2977,7 +3299,21 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
     return true;
   }
 
+  ReadbackResolveMode readback_mode = GetReadbackResolveModeFor(
+      GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve)), written_address,
+      written_length);
+  if (readback_mode == ReadbackResolveMode::kDisabled) {
+    return true;
+  }
+
   bool is_scaled = texture_cache_->IsDrawResolutionScaled();
+  if (written_address == 0x19BC0000 && std::getenv("SKY_RBDIAG")) {
+    static int n = 0;
+    if (n++ < 3) {
+      REXGPU_WARN("rbdiag: readback path for {:08X}+{:X} scaled {}", written_address,
+                  written_length, is_scaled);
+    }
+  }
   uint64_t resolve_key = MakeReadbackResolveKey(written_address, written_length);
   ReadbackBuffer& rb = readback_buffers_[resolve_key];
   rb.last_used_frame = frame_current_;
@@ -3145,7 +3481,6 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
                                                written_address, written_length);
   }
 
-  ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
   bool use_delayed_sync =
       readback_mode == ReadbackResolveMode::kFast || readback_mode == ReadbackResolveMode::kSome;
   uint32_t read_index = write_index;
@@ -3171,6 +3506,31 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
     uint8_t* destination = memory_->TranslatePhysical(written_address);
     if (destination) {
       std::memcpy(destination, static_cast<uint8_t*>(rb.mapped_data[read_index]), written_length);
+    }
+    // Diagnostic (Skylanders shadow square): the CPU shadow classifier reads the depth resolve
+    // at 0x19BC0000 and sees zeros. Every 5 s, log how much of each readback is non-zero.
+    static const bool rbdiag = std::getenv("SKY_RBDIAG") != nullptr;
+    if (rbdiag) {
+      static std::unordered_map<uint32_t, int64_t> last_log;
+      int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+      int64_t& prev = last_log[written_address];
+      if (now - prev >= 5) {
+        prev = now;
+        const uint32_t* words = static_cast<const uint32_t*>(rb.mapped_data[read_index]);
+        uint32_t nonzero = 0;
+        for (uint32_t i = 0; i < written_length / 4; ++i) {
+          nonzero += words[i] != 0;
+        }
+        auto info = register_file_->Get<reg::RB_COPY_CONTROL>();
+        auto dest = register_file_->Get<reg::RB_COPY_DEST_INFO>();
+        REXGPU_INFO("rbdiag: {:08X}+{:X} nonzero words {} copy_src_select {} depth_clear {} "
+                    "dest fmt {} endian {} scaled {}",
+                    written_address, written_length, nonzero, uint32_t(info.copy_src_select),
+                    uint32_t(info.depth_clear_enable), uint32_t(dest.copy_dest_format),
+                    uint32_t(dest.copy_dest_endian), is_scaled);
+      }
     }
   }
 
@@ -4243,6 +4603,12 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
     }
     std::memcpy(bool_loop_constants, &regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031],
                 kBoolLoopConstantsSize);
+    // Diagnostic (Skylanders shadow square): SKY_NOB128 forces pixel bool b128 off, which
+    // skips the ground shader's projected-shadow branch.
+    static const bool sky_nob128 = std::getenv("SKY_NOB128") != nullptr;
+    if (sky_nob128) {
+      reinterpret_cast<uint32_t*>(bool_loop_constants)[4] &= ~1u;
+    }
     cbuffer_binding_bool_loop_.up_to_date = true;
     current_graphics_root_up_to_date_ &= ~(1u << root_parameter_bool_loop_constants);
   }

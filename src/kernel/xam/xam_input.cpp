@@ -218,10 +218,7 @@ REX_EXPORT_STUB(__imp__XamInputGetKeyLocks);
 REX_EXPORT_STUB(__imp__XamInputGetKeystrokeHud);
 REX_EXPORT_STUB(__imp__XamInputGetKeystrokeHudEx);
 REX_EXPORT_STUB(__imp__XamInputGetUserVibrationLevel);
-REX_EXPORT_STUB(__imp__XamInputNonControllerGetRaw);
-REX_EXPORT_STUB(__imp__XamInputNonControllerGetRawEx);
-REX_EXPORT_STUB(__imp__XamInputNonControllerSetRaw);
-REX_EXPORT_STUB(__imp__XamInputNonControllerSetRawEx);
+// XamInputNonController{Get,Set}Raw{,Ex}: see xam_portal.cpp (Skylanders portal).
 REX_EXPORT_STUB(__imp__XamInputRawState);
 REX_EXPORT_STUB(__imp__XamInputResetLayoutKeyboard);
 REX_EXPORT_STUB(__imp__XamInputSendStayAliveRequest);

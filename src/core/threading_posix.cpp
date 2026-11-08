@@ -336,6 +336,9 @@ class PosixConditionBase {
                         : start_time + timeout;
 
     while (true) {
+      // Read the signal generation before looking at the handles: a signal that lands after
+      // the check below bumps it, so the sleep at the bottom cannot miss it.
+      uint64_t observed_generation = multi_wait_generation_.load(std::memory_order_acquire);
       size_t first_signaled = std::numeric_limits<size_t>::max();
       bool condition_met = false;
       bool all_locked = true;
@@ -411,14 +414,30 @@ class PosixConditionBase {
         return std::make_pair<WaitResult, size_t>(WaitResult::kTimeout, 0);
       }
 
+      // Sleep until any condition is signaled (or the deadline), as Xenia's shared condition
+      // variable does. This used to poll with sleep_for(1 ms), which woke waiters up to a
+      // millisecond late and spun on sub-millisecond remainders (duration_cast rounded the
+      // sleep to 0): a busy core per waiting thread and slow job handoffs on Linux.
+      std::unique_lock<std::mutex> multi_lock(multi_wait_mutex_);
+      auto changed = [observed_generation] {
+        return multi_wait_generation_.load(std::memory_order_acquire) != observed_generation;
+      };
       if (timeout == std::chrono::milliseconds::max()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        multi_wait_cond_.wait(multi_lock, changed);
       } else {
-        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - now);
-        auto sleep_time = std::min(remaining, std::chrono::milliseconds(1));
-        std::this_thread::sleep_for(sleep_time);
+        multi_wait_cond_.wait_until(multi_lock, end_time, changed);
       }
     }
+  }
+
+  // Wakes WaitMultiple callers so they re-check their handles. Call after changing a
+  // condition's signaled state (with or without its mutex held).
+  static void NotifyMultiWaiters() {
+    {
+      std::lock_guard<std::mutex> multi_lock(multi_wait_mutex_);
+      multi_wait_generation_.fetch_add(1, std::memory_order_acq_rel);
+    }
+    multi_wait_cond_.notify_all();
   }
 
   virtual void* native_handle() const {
@@ -430,6 +449,12 @@ class PosixConditionBase {
   inline virtual void post_execution() = 0;
   std::condition_variable cond_;
   std::mutex mutex_;
+
+  // Shared by all conditions for multi-object waits (lock order: a condition's mutex_, then
+  // multi_wait_mutex_; WaitMultiple never holds a condition's mutex while sleeping).
+  static inline std::mutex multi_wait_mutex_;
+  static inline std::condition_variable multi_wait_cond_;
+  static inline std::atomic<uint64_t> multi_wait_generation_{0};
 };
 
 // There really is no native POSIX handle for a single wait/signal construct
@@ -450,6 +475,7 @@ class PosixCondition<Event> : public PosixConditionBase {
     auto lock = std::unique_lock<std::mutex>(mutex_);
     signal_ = true;
     cond_.notify_all();
+    NotifyMultiWaiters();
     return true;
   }
 
@@ -487,6 +513,7 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
     }
     count_ += release_count;
     cond_.notify_all();
+    NotifyMultiWaiters();
     return true;
   }
 
@@ -519,6 +546,7 @@ class PosixCondition<Mutant> : public PosixConditionBase {
       // Free to be acquired by another thread
       if (count_ == 0) {
         cond_.notify_all();
+        NotifyMultiWaiters();
       }
       return true;
     }
@@ -551,6 +579,7 @@ class PosixCondition<Timer> : public PosixConditionBase {
     std::lock_guard<std::mutex> lock(mutex_);
     signal_ = true;
     cond_.notify_all();
+    NotifyMultiWaiters();
     return true;
   }
 
@@ -979,6 +1008,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
       exit_code_ = exit_code;
       signaled_ = true;
       cond_.notify_all();
+      NotifyMultiWaiters();
     }
     if (is_current_thread) {
       pthread_exit(reinterpret_cast<void*>(exit_code));
@@ -1449,6 +1479,7 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
     thread->handle_.exit_code_ = 0;
     thread->handle_.signaled_ = true;
     thread->handle_.cond_.notify_all();
+    PosixConditionBase::NotifyMultiWaiters();
   }
 
   current_thread_ = nullptr;

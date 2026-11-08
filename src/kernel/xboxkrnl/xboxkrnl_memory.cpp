@@ -12,7 +12,17 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <rex/platform.h>
+#if REX_PLATFORM_WIN32
+#include <windows.h>
+#include <dbghelp.h>
+#include <tlhelp32.h>
+#pragma comment(lib, "dbghelp.lib")
+#endif
 
 #include <rex/assert.h>
 #include <rex/kernel/xboxkrnl/private.h>
@@ -197,6 +207,16 @@ u32 NtAllocateVirtualMemory_entry(mapped_u32 base_addr_ptr, mapped_u32 region_si
   *region_size_ptr = adjusted_size;
   REXKRNL_IMPORT_RESULT("NtAllocateVirtualMemory", "0x0 addr={:#x} size={:#x}", address,
                         adjusted_size);
+  {
+    uint32_t pdiag_phys = REX_KERNEL_MEMORY()->GetPhysicalAddress(address);
+    if (pdiag_phys != UINT32_MAX && pdiag_phys <= 0x1C659000 &&
+        pdiag_phys + adjusted_size > 0x1C658000) {
+      REXKRNL_INFO("pdiag: NtAllocateVirtualMemory {:08X} size {:#x} type {:#x} protect {:#x} "
+                   "(phys {:08X})",
+                   address, adjusted_size, (uint32_t)alloc_type, (uint32_t)protect_bits,
+                   pdiag_phys);
+    }
+  }
   return X_STATUS_SUCCESS;
 }
 
@@ -344,12 +364,301 @@ u32 NtQueryVirtualMemory_entry(u32 base_address,
   return X_STATUS_SUCCESS;
 }
 
+#if REX_PLATFORM_WIN32
+// Diagnostic (Skylanders shadow square): with SKY_WATCH set, guard every host alias of the
+// physical pages 0x1C658000 and 0x1C659000 and log which code writes them (symbol + value).
+namespace {
+struct WatchPage {
+  uint8_t* host;
+  const char* name;
+};
+WatchPage g_watch_pages[8];
+int g_watch_count = 0;
+thread_local int g_watch_rearm = -1;
+std::atomic<int> g_watch_hits{0};
+FILE* g_watch_file = nullptr;
+
+void WatchLog(const char* text) {
+  if (g_watch_file) {
+    std::fputs(text, g_watch_file);
+    std::fflush(g_watch_file);
+  }
+}
+
+LONG CALLBACK WatchHandler(EXCEPTION_POINTERS* ep) {
+  DWORD code = ep->ExceptionRecord->ExceptionCode;
+  if (code == STATUS_GUARD_PAGE_VIOLATION) {
+    auto addr = reinterpret_cast<uint8_t*>(ep->ExceptionRecord->ExceptionInformation[1]);
+    for (int i = 0; i < g_watch_count; ++i) {
+      if (addr >= g_watch_pages[i].host && addr < g_watch_pages[i].host + 0x1000) {
+        if (ep->ExceptionRecord->ExceptionInformation[0] == 1 && g_watch_hits.fetch_add(1) < 200) {
+          char sym_buf[sizeof(SYMBOL_INFO) + 256] = {};
+          auto* sym = reinterpret_cast<SYMBOL_INFO*>(sym_buf);
+          sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+          sym->MaxNameLen = 255;
+          DWORD64 disp = 0;
+          const char* name = "?";
+          if (SymFromAddr(GetCurrentProcess(), ep->ContextRecord->Rip, &disp, sym)) {
+            name = sym->Name;
+          }
+          char line[512];
+          std::snprintf(line, sizeof(line),
+                        "write %s +%03X rip %016llX %s+%llX thread %lu\n", g_watch_pages[i].name,
+                        unsigned(addr - g_watch_pages[i].host),
+                        (unsigned long long)ep->ContextRecord->Rip, name,
+                        (unsigned long long)disp, GetCurrentThreadId());
+          WatchLog(line);
+        }
+        g_watch_rearm = i;
+        ep->ContextRecord->EFlags |= 0x100;  // single-step, then re-arm the guard
+        return EXCEPTION_CONTINUE_EXECUTION;
+      }
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+  }
+  if (code == EXCEPTION_SINGLE_STEP && g_watch_rearm >= 0) {
+    DWORD old;
+    VirtualProtect(g_watch_pages[g_watch_rearm].host, 0x1000, PAGE_READWRITE | PAGE_GUARD, &old);
+    g_watch_rearm = -1;
+    return EXCEPTION_CONTINUE_EXECUTION;
+  }
+  return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// Hardware write breakpoints (SKY_DRWATCH): debug registers on host aliases of the first
+// dword of 0x1C659000 (A0 view, E0 view, physical view) and 0x1C658000 (A0 view). A
+// background thread arms every thread in the process; the handler logs a stack of symbols.
+struct DrSlot {
+  uint8_t* host;
+  const char* name;
+};
+DrSlot g_dr_slots[4];
+std::atomic<int> g_dr_hits{0};
+
+LONG CALLBACK DrHandler(EXCEPTION_POINTERS* ep) {
+  if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) {
+    return EXCEPTION_CONTINUE_SEARCH;
+  }
+  CONTEXT* c = ep->ContextRecord;
+  DWORD64 dr6 = c->Dr6;
+  if (!(dr6 & 0xF)) {
+    return EXCEPTION_CONTINUE_SEARCH;
+  }
+  c->Dr6 = 0;
+  // Command-buffer slots are rewritten constantly; only the bad fetch constant matters.
+  if (false) {
+    bool interesting = false;
+    for (int i = 0; i < 3; ++i) {
+      const uint8_t* b = g_dr_slots[i].host;
+      if ((dr6 & (1ull << i)) && b[0] == 0x1C && b[1] == 0x65) {
+        interesting = true;
+      }
+    }
+    if (!interesting) {
+      return EXCEPTION_CONTINUE_EXECUTION;
+    }
+  }
+  int n = g_dr_hits.fetch_add(1);
+  if (n < 400) {
+    for (int i = 0; i < 4; ++i) {
+      if (!(dr6 & (1ull << i))) {
+        continue;
+      }
+      const uint8_t* b = g_dr_slots[i].host;
+      char line[2048];
+      int len = std::snprintf(line, sizeof(line), "hit %d %s now %02X%02X%02X%02X thread %lu:", n,
+                              g_dr_slots[i].name, b[0], b[1], b[2], b[3], GetCurrentThreadId());
+      CONTEXT walk = *c;
+      STACKFRAME64 frame = {};
+      frame.AddrPC.Offset = walk.Rip;
+      frame.AddrPC.Mode = AddrModeFlat;
+      frame.AddrFrame.Offset = walk.Rbp;
+      frame.AddrFrame.Mode = AddrModeFlat;
+      frame.AddrStack.Offset = walk.Rsp;
+      frame.AddrStack.Mode = AddrModeFlat;
+      for (int depth = 0; depth < 8 && len < 1900; ++depth) {
+        if (depth > 0 &&
+            !StackWalk64(IMAGE_FILE_MACHINE_AMD64, GetCurrentProcess(), GetCurrentThread(), &frame,
+                         &walk, nullptr, SymFunctionTableAccess64, SymGetModuleBase64, nullptr)) {
+          break;
+        }
+        char sym_buf[sizeof(SYMBOL_INFO) + 128] = {};
+        auto* sym = reinterpret_cast<SYMBOL_INFO*>(sym_buf);
+        sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+        sym->MaxNameLen = 127;
+        DWORD64 disp = 0;
+        DWORD64 pc = frame.AddrPC.Offset;
+        if (SymFromAddr(GetCurrentProcess(), pc, &disp, sym)) {
+          len += std::snprintf(line + len, sizeof(line) - len, " %s+%llX", sym->Name,
+                               (unsigned long long)disp);
+        } else {
+          len += std::snprintf(line + len, sizeof(line) - len, " %llX", (unsigned long long)pc);
+        }
+      }
+      std::snprintf(line + len, sizeof(line) - len, "\n");
+      WatchLog(line);
+    }
+  }
+  return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+void InstallDrWatch() {
+  static bool installed = false;
+  if (installed || !std::getenv("SKY_DRWATCH")) {
+    return;
+  }
+  installed = true;
+  g_watch_file = std::fopen("H:\\skylanders-sa\\logs\\drwatch.log", "w");
+  SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+  SymInitialize(GetCurrentProcess(), nullptr, TRUE);
+  auto* mem = REX_KERNEL_MEMORY();
+  uint8_t* v = mem->virtual_membase();
+  uint8_t* p = mem->physical_membase();
+  // Fourth round: the per-tile shadow class buffer (0x1C2BEA80, CPU-written), dword holding
+  // tile row 12 col 16 (byte 0x1C2BEC43), through every host alias.
+  g_dr_slots[0] = {v + 0xBC2BEC40, "tileA0"};
+  g_dr_slots[1] = {v + 0xFC2BEC40, "tileE0"};
+  g_dr_slots[2] = {p + 0x1C2BEC40, "tilePhys"};
+  g_dr_slots[3] = {v + 0xDC2BEC40, "tileC0"};
+  char line[256];
+  std::snprintf(line, sizeof(line), "drwatch armed: %p %p %p %p\n", g_dr_slots[0].host,
+                g_dr_slots[1].host, g_dr_slots[2].host, g_dr_slots[3].host);
+  WatchLog(line);
+  AddVectoredExceptionHandler(1, DrHandler);
+  HANDLE first_pass = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  CreateThread(
+      nullptr, 0,
+      [](LPVOID param) -> DWORD {
+        static uint32_t armed[4096];
+        int armed_count = 0;
+        DWORD self = GetCurrentThreadId();
+        DWORD pid = GetCurrentProcessId();
+        for (;;) {
+          HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+          THREADENTRY32 te = {sizeof(te)};
+          if (snap != INVALID_HANDLE_VALUE && Thread32First(snap, &te)) {
+            do {
+              if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) {
+                continue;
+              }
+              bool done = false;
+              for (int i = 0; i < armed_count; ++i) {
+                if (armed[i] == te.th32ThreadID) {
+                  done = true;
+                  break;
+                }
+              }
+              if (done || armed_count >= 4096) {
+                continue;
+              }
+              HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT,
+                                    FALSE, te.th32ThreadID);
+              if (!t) {
+                continue;
+              }
+              if (SuspendThread(t) != (DWORD)-1) {
+                CONTEXT ctx = {};
+                ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+                if (GetThreadContext(t, &ctx)) {
+                  ctx.Dr0 = (DWORD64)g_dr_slots[0].host;
+                  ctx.Dr1 = (DWORD64)g_dr_slots[1].host;
+                  ctx.Dr2 = (DWORD64)g_dr_slots[2].host;
+                  ctx.Dr3 = (DWORD64)g_dr_slots[3].host;
+                  // L0-L3 enabled, each RW=01 (write) LEN=11 (4 bytes).
+                  ctx.Dr7 = 0x55ull | (0xDDDDull << 16);
+                  if (SetThreadContext(t, &ctx)) {
+                    armed[armed_count++] = te.th32ThreadID;
+                  }
+                }
+                ResumeThread(t);
+              }
+              CloseHandle(t);
+            } while (Thread32Next(snap, &te));
+          }
+          if (snap != INVALID_HANDLE_VALUE) {
+            CloseHandle(snap);
+          }
+          SetEvent(reinterpret_cast<HANDLE>(param));
+          Sleep(2);
+        }
+      },
+      first_pass, 0, nullptr);
+  // Wait for the first pass so the calling thread is armed before it returns.
+  WaitForSingleObject(first_pass, 5000);
+}
+
+void InstallTexelWatch() {
+  static bool installed = false;
+  if (installed || !std::getenv("SKY_WATCH")) {
+    return;
+  }
+  installed = true;
+  g_watch_file = std::fopen("H:\\skylanders-sa\\logs\\watch.log", "w");
+  SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+  SymInitialize(GetCurrentProcess(), nullptr, TRUE);
+  auto* mem = REX_KERNEL_MEMORY();
+  uint8_t* v = mem->virtual_membase();
+  uint8_t* p = mem->physical_membase();
+  WatchPage pages[] = {
+      {p + 0x1C658000, "phys1C658000"},     {p + 0x1C659000, "phys1C659000"},
+      {v + 0xBC658000, "vBC658000"},        {v + 0xBC659000, "vBC659000"},
+      {v + 0xDC658000, "vDC658000"},        {v + 0xDC659000, "vDC659000"},
+      {v + 0xFC658000, "hostFC658000(=p58)"}, {v + 0xFC659000, "hostFC659000(=p59)"},
+  };
+  AddVectoredExceptionHandler(1, WatchHandler);
+  // Committing or re-protecting a page drops PAGE_GUARD, so re-arm from a background thread.
+  CreateThread(
+      nullptr, 0,
+      [](LPVOID) -> DWORD {
+        for (;;) {
+          Sleep(20);
+          for (int i = 0; i < g_watch_count; ++i) {
+            MEMORY_BASIC_INFORMATION mbi;
+            if (VirtualQuery(g_watch_pages[i].host, &mbi, sizeof(mbi)) &&
+                mbi.State == MEM_COMMIT && !(mbi.Protect & PAGE_GUARD) &&
+                (mbi.Protect & (PAGE_READWRITE | PAGE_READONLY))) {
+              DWORD old;
+              VirtualProtect(g_watch_pages[i].host, 0x1000, mbi.Protect | PAGE_GUARD, &old);
+              static std::atomic<int> rearms{0};
+              if (rearms.fetch_add(1) < 100) {
+                char line[160];
+                std::snprintf(line, sizeof(line), "re-armed %s (protect was %lX)\n",
+                              g_watch_pages[i].name, old);
+                WatchLog(line);
+              }
+            }
+          }
+        }
+      },
+      nullptr, 0, nullptr);
+  for (auto& page : pages) {
+    DWORD old;
+    if (VirtualProtect(page.host, 0x1000, PAGE_READWRITE | PAGE_GUARD, &old)) {
+      g_watch_pages[g_watch_count++] = page;
+      char line[160];
+      std::snprintf(line, sizeof(line), "armed %s at %p (old protect %lX)\n", page.name, page.host,
+                    old);
+      WatchLog(line);
+    } else {
+      char line[160];
+      std::snprintf(line, sizeof(line), "could not arm %s at %p (error %lu)\n", page.name,
+                    page.host, GetLastError());
+      WatchLog(line);
+    }
+  }
+}
+}  // namespace
+#endif
+
 u32 MmAllocatePhysicalMemoryEx_entry(u32 flags, u32 region_size, u32 protect_bits,
                                      u32 min_addr_range, u32 max_addr_range, u32 alignment) {
   REXKRNL_IMPORT_TRACE("MmAllocatePhysicalMemoryEx",
                        "flags={:#x} size={:#x} protect={:#x} min={:#x} max={:#x} align={:#x}",
                        (uint32_t)flags, (uint32_t)region_size, (uint32_t)protect_bits,
                        (uint32_t)min_addr_range, (uint32_t)max_addr_range, (uint32_t)alignment);
+#if REX_PLATFORM_WIN32
+  InstallDrWatch();
+#endif
 
   // Check protection bits.
   if (!(protect_bits & (X_PAGE_READONLY | X_PAGE_READWRITE))) {
@@ -403,6 +712,14 @@ u32 MmAllocatePhysicalMemoryEx_entry(u32 flags, u32 region_size, u32 protect_bit
     return 0;
   }
   REXKRNL_IMPORT_RESULT("MmAllocatePhysicalMemoryEx", "addr={:#x}", base_address);
+  // Diagnostic (Skylanders shadow square): allocations around the 1x1 placeholder texture.
+  uint32_t pdiag_phys = heap->GetPhysicalAddress(base_address);
+  if (pdiag_phys <= 0x1C659000 && pdiag_phys + adjusted_size > 0x1C658000) {
+    REXKRNL_INFO("pdiag: MmAllocatePhysicalMemoryEx size {:#x} protect {:#x} align {:#x} -> {:08X} "
+                 "(phys {:08X})",
+                 (uint32_t)region_size, (uint32_t)protect_bits, (uint32_t)alignment, base_address,
+                 heap->GetPhysicalAddress(base_address));
+  }
 
   return base_address;
 }
@@ -566,6 +883,10 @@ u32 MmGetPhysicalAddress_entry(u32 base_address) {
   }
   REXKRNL_IMPORT_RESULT("MmGetPhysicalAddress", "addr={:#x} -> {:#x}", (uint32_t)base_address,
                         physical_address);
+  if (((uint32_t(base_address) & 0x1FFFFFFF) >> 20) == 0x1C6) {
+    REXKRNL_INFO("pdiag: MmGetPhysicalAddress {:08X} -> {:08X}", (uint32_t)base_address,
+                 physical_address);
+  }
   return physical_address;
 }
 

@@ -12,6 +12,8 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <atomic>
+#include <cerrno>
 #include <cstring>
 
 #if REX_PLATFORM_MAC
@@ -578,6 +580,24 @@ u32 NetDll_inet_addr_entry(mapped_string addr_ptr) {
   return rex::byte_swap(addr);
 }
 
+// Socket call trace (first kNetTraceMax calls of each kind; enough to see a
+// title's boot-time network setup without flooding a polling loop).
+static constexpr int kNetTraceMax = 64;
+#define NET_TRACE(counter, ...)          \
+  do {                                   \
+    static std::atomic<int> counter{0};  \
+    if (counter++ < kNetTraceMax) {      \
+      REXKRNL_INFO(__VA_ARGS__);         \
+    }                                    \
+  } while (0)
+static int net_last_error() {
+#if REX_PLATFORM_WIN32
+  return WSAGetLastError();
+#else
+  return errno;
+#endif
+}
+
 u32 NetDll_socket_entry(u32 caller, u32 af, u32 type, u32 protocol) {
   XSocket* socket = new XSocket(REX_KERNEL_STATE());
   X_STATUS result =
@@ -586,12 +606,16 @@ u32 NetDll_socket_entry(u32 caller, u32 af, u32 type, u32 protocol) {
 
   if (XFAILED(result)) {
     socket->Release();
+    NET_TRACE(n_fail, "net: socket(af {}, type {}, proto {}) failed, err {}", (uint32_t)af,
+              (uint32_t)type, (uint32_t)protocol, net_last_error());
 
     uint32_t error = xboxkrnl::xeRtlNtStatusToDosError(result);
     XThread::SetLastError(error);
     return -1;
   }
 
+  NET_TRACE(n, "net: socket(af {}, type {}, proto {}) -> {:08X}", (uint32_t)af, (uint32_t)type,
+            (uint32_t)protocol, socket->handle());
   return socket->handle();
 }
 
@@ -640,6 +664,9 @@ u32 NetDll_setsockopt_entry(u32 caller, u32 socket_handle, u32 level, u32 optnam
   }
 
   X_STATUS status = socket->SetOption(level, optname, optval_ptr, optlen);
+  NET_TRACE(n, "net: setsockopt({:08X}, level {:X}, opt {:X}, len {}, val(BE) {:08X}) -> {:X}",
+            (uint32_t)socket_handle, (uint32_t)level, (uint32_t)optname, (uint32_t)optlen,
+            optlen >= 4 ? (uint32_t)*optval_ptr.as<rex::be<uint32_t>*>() : 0u, status);
   return XSUCCEEDED(status) ? 0 : -1;
 }
 
@@ -652,6 +679,9 @@ u32 NetDll_ioctlsocket_entry(u32 caller, u32 socket_handle, u32 cmd, mapped_void
   }
 
   X_STATUS status = socket->IOControl(cmd, arg_ptr);
+  NET_TRACE(n, "net: ioctlsocket({:08X}, cmd {:08X}, arg(BE) {:08X}) -> {:X}",
+            (uint32_t)socket_handle, (uint32_t)cmd,
+            arg_ptr ? (uint32_t)*arg_ptr.as<rex::be<uint32_t>*>() : 0u, status);
   if (XFAILED(status)) {
     XThread::SetLastError(xboxkrnl::xeRtlNtStatusToDosError(status));
     return -1;
@@ -671,6 +701,9 @@ u32 NetDll_bind_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> nam
 
   N_XSOCKADDR_IN native_name(name);
   X_STATUS status = socket->Bind(&native_name, namelen);
+  NET_TRACE(n, "net: bind({:08X}, addr {:08X} port {}) -> {:X} err {}", (uint32_t)socket_handle,
+            (uint32_t)name->sin_addr, (uint32_t)name->sin_port, status,
+            XFAILED(status) ? net_last_error() : 0);
   if (XFAILED(status)) {
     XThread::SetLastError(xboxkrnl::xeRtlNtStatusToDosError(status));
     return -1;
@@ -689,6 +722,8 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
 
   N_XSOCKADDR native_name(name);
   X_STATUS status = socket->Connect(&native_name, namelen);
+  NET_TRACE(n, "net: connect({:08X}, len {}) -> {:X} err {}", (uint32_t)socket_handle,
+            (uint32_t)namelen, status, XFAILED(status) ? net_last_error() : 0);
   if (XFAILED(status)) {
     XThread::SetLastError(xboxkrnl::xeRtlNtStatusToDosError(status));
     return -1;
@@ -827,6 +862,10 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
   }
   int ret = select(nfds, readfds ? &native_readfds : nullptr, writefds ? &native_writefds : nullptr,
                    exceptfds ? &native_exceptfds : nullptr, timeout_in);
+  NET_TRACE(n, "net: select(r {} w {} e {}, timeout {}) -> {} err {}", host_readfds.count,
+            host_writefds.count, host_exceptfds.count,
+            timeout_in ? int64_t(timeout.tv_sec) * 1000000 + timeout.tv_usec : -1, ret,
+            ret < 0 ? net_last_error() : 0);
   if (readfds) {
     host_readfds.UpdateFrom(&native_readfds);
     host_readfds.Store(readfds);
@@ -869,8 +908,12 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
     native_from = *from_ptr;
   }
   uint32_t native_fromlen = fromlen_ptr ? fromlen_ptr.value() : 0;
+  NET_TRACE(n_in, "net: recvfrom({:08X}, len {}, flags {:X}) caller {:08X} ...",
+            (uint32_t)socket_handle, (uint32_t)buf_len, (uint32_t)flags, (uint32_t)caller);
   int ret =
       socket->RecvFrom(buf_ptr, buf_len, flags, &native_from, fromlen_ptr ? &native_fromlen : 0);
+  NET_TRACE(n_out, "net: recvfrom({:08X}) -> {} err {}", (uint32_t)socket_handle, ret,
+            ret < 0 ? net_last_error() : 0);
 
   if (from_ptr) {
     from_ptr->sin_family = native_from.sin_family;
@@ -916,7 +959,11 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 
   }
 
   N_XSOCKADDR_IN native_to(to_ptr);
-  return socket->SendTo(buf_ptr, buf_len, flags, &native_to, to_len);
+  int ret = socket->SendTo(buf_ptr, buf_len, flags, &native_to, to_len);
+  NET_TRACE(n, "net: sendto({:08X}, len {}, to {:08X}:{}) -> {} err {}", (uint32_t)socket_handle,
+            (uint32_t)buf_len, to_ptr ? (uint32_t)to_ptr->sin_addr : 0u,
+            to_ptr ? (uint32_t)to_ptr->sin_port : 0u, ret, ret < 0 ? net_last_error() : 0);
+  return ret;
 }
 
 u32 NetDll___WSAFDIsSet_entry(u32 socket_handle, ppc_ptr_t<x_fd_set> fd_set) {

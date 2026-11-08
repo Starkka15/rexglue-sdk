@@ -12,7 +12,10 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <array>
 #include <cstdio>
+#include <mutex>
+#include <set>
 #include <string>
 #include <utility>
 #ifdef _WIN32
@@ -405,6 +408,22 @@ bool TextureCache::PrepareTextureLoad(Texture& texture, PendingTextureLoad& pend
     return false;
   }
 
+  // Diagnostic (Skylanders shadow square): reloads per second of the two shadow maps.
+  {
+    uint32_t base = uint32_t(texture.key().base_page) << 12;
+    if (base == 0x1A960000 || base == 0x1AD60000) {
+      static std::atomic<uint32_t> loads_near{0}, loads_far{0};
+      static std::atomic<int64_t> window{0};
+      (base == 0x1AD60000 ? loads_near : loads_far)++;
+      int64_t now = int64_t(rex::chrono::Clock::QueryHostUptimeMillis());
+      int64_t start = window.load();
+      if (now - start >= 1000 && window.compare_exchange_strong(start, now)) {
+        REXGPU_INFO("sload: 1AD60000 {} loads/s, 1A960000 {} loads/s", loads_near.exchange(0),
+                    loads_far.exchange(0));
+      }
+    }
+  }
+
   pending_load_out.texture = &texture;
   pending_load_out.load_base = base_outdated;
   pending_load_out.load_mips = mips_outdated;
@@ -570,6 +589,32 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     uint8_t old_swizzled_signs = binding.swizzled_signs;
     BindingInfoFromFetchConstant(fetch, binding.key, &binding.swizzled_signs);
     texture_bindings_in_sync_ |= index_bit;
+    // Diagnostic (Skylanders shadow square): how the shadow maps are fetched.
+    {
+      uint32_t base = uint32_t(fetch.base_address) << 12;
+      if (base == 0x1A960000 || base == 0x1AD60000 || base == 0x1A4F0000) {
+        static std::mutex sdiag_mutex;
+        static std::set<std::array<uint32_t, 7>> sdiag_seen;
+        std::lock_guard<std::mutex> sdiag_lock(sdiag_mutex);
+        std::array<uint32_t, 7> sig = {index,         fetch.dword_0, fetch.dword_1, fetch.dword_2,
+                                       fetch.dword_3, fetch.dword_4, fetch.dword_5};
+        if (sdiag_seen.size() < 200 && sdiag_seen.insert(sig).second) {
+          REXGPU_INFO(
+              "sdiag: slot {} base {:08X} fmt {} endian {} tiled {} signs {}{}{}{} clamp {}/{}/{} "
+              "border {} mag {} min {} mip {} aniso {} swizzle {:03o} dims {} {}x{} valid {} "
+              "dwords {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
+              index, base, uint32_t(fetch.format), uint32_t(fetch.endianness),
+              uint32_t(fetch.tiled), uint32_t(fetch.sign_x), uint32_t(fetch.sign_y),
+              uint32_t(fetch.sign_z), uint32_t(fetch.sign_w), uint32_t(fetch.clamp_x),
+              uint32_t(fetch.clamp_y), uint32_t(fetch.clamp_z), uint32_t(fetch.border_color),
+              uint32_t(fetch.mag_filter), uint32_t(fetch.min_filter), uint32_t(fetch.mip_filter),
+              uint32_t(fetch.aniso_filter), uint32_t(fetch.swizzle), uint32_t(fetch.dimension),
+              uint32_t(fetch.size_2d.width) + 1, uint32_t(fetch.size_2d.height) + 1,
+              uint32_t(binding.key.is_valid), fetch.dword_0, fetch.dword_1, fetch.dword_2,
+              fetch.dword_3, fetch.dword_4, fetch.dword_5);
+        }
+      }
+    }
     if (!binding.key.is_valid) {
       if (old_key.is_valid) {
         bindings_changed |= index_bit;

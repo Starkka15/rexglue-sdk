@@ -10,11 +10,15 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
+#include <string>
 #include <string_view>
+#include <vector>
 
 #include <fmt/format.h>
 
@@ -62,6 +66,18 @@ REXCVAR_DEFINE_STRING(readback_resolve, "none", "GPU",
     .allowed({"none", "fast", "some", "full"})
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_STRING(readback_resolve_addresses, "", "GPU",
+                      "Comma-separated physical addresses (hex) inside resolve destinations that "
+                      "the guest CPU reads. Resolves covering any of these addresses are read "
+                      "back with an immediate sync, even when readback_resolve is none. Much "
+                      "cheaper than readback_resolve=full when a title reads only a few resolves.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(readback_resolve_addresses_delayed, false, "GPU",
+                    "Read back the resolves listed in readback_resolve_addresses one frame late "
+                    "(like readback_resolve=fast) instead of waiting for the GPU each time")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(readback_resolve_half_pixel_offset, false, "GPU",
                     "When draw resolution scaling is active, sample from the center of each "
                     "scaled block during resolve readback downscale")
@@ -89,6 +105,8 @@ REXCVAR_DEFINE_BOOL(async_shader_compilation, true, "GPU",
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics {
+
+extern std::atomic<uint64_t> g_guest_vblank_count;  // graphics_system.cpp
 
 using namespace rex::graphics::xenos;
 
@@ -189,6 +207,57 @@ ReadbackResolveMode CommandProcessor::GetReadbackResolveMode(
                                          : ReadbackResolveMode::kDisabled;
 }
 
+namespace {
+// Parsed readback_resolve_addresses, re-parsed when the cvar text changes (hot reload).
+struct ReadbackAddressList {
+  std::string text;
+  std::vector<uint32_t> addresses;
+};
+const std::vector<uint32_t>& GetReadbackResolveAddresses() {
+  static ReadbackAddressList list;
+  std::string current = REXCVAR_GET(readback_resolve_addresses);
+  if (current != list.text) {
+    list.text = current;
+    list.addresses.clear();
+    size_t pos = 0;
+    while (pos < current.size()) {
+      size_t end = current.find(',', pos);
+      if (end == std::string::npos) {
+        end = current.size();
+      }
+      std::string item = current.substr(pos, end - pos);
+      item.erase(std::remove_if(item.begin(), item.end(), [](char c) { return c == ' '; }),
+                 item.end());
+      if (!item.empty()) {
+        list.addresses.push_back(uint32_t(std::strtoul(item.c_str(), nullptr, 16)) & 0x1FFFFFFF);
+      }
+      pos = end + 1;
+    }
+  }
+  return list.addresses;
+}
+}  // namespace
+
+bool CommandProcessor::HasReadbackResolveAddresses() const {
+  return !GetReadbackResolveAddresses().empty();
+}
+
+ReadbackResolveMode CommandProcessor::GetReadbackResolveModeFor(ReadbackResolveMode global_mode,
+                                                                uint32_t written_address,
+                                                                uint32_t written_length) const {
+  if (global_mode != ReadbackResolveMode::kDisabled) {
+    return global_mode;
+  }
+  uint32_t start = written_address & 0x1FFFFFFF;
+  for (uint32_t address : GetReadbackResolveAddresses()) {
+    if (address >= start && address - start < written_length) {
+      return REXCVAR_GET(readback_resolve_addresses_delayed) ? ReadbackResolveMode::kFast
+                                                              : ReadbackResolveMode::kFull;
+    }
+  }
+  return ReadbackResolveMode::kDisabled;
+}
+
 bool CommandProcessor::IsReadbackMemexportEnabled(bool legacy_backend_flag) const {
   if (legacy_readback_memexport_cvar_name_ &&
       rex::cvar::HasNonDefaultValue(legacy_readback_memexport_cvar_name_)) {
@@ -247,6 +316,15 @@ void CommandProcessor::WorkerThreadMain() {
     assert_true(read_ptr_index_ != write_ptr_index);
 
     // Execute. Note that we handle wraparound transparently.
+    {
+      static int batches_logged = 0;
+      if (batches_logged < 40) {
+        ++batches_logged;
+        REXGPU_INFO("cpbatch #{}: read {:X} write {:X} (ring {:X} bytes, rptr writeback {:08X})",
+                    batches_logged, read_ptr_index_, write_ptr_index, primary_buffer_size_,
+                    read_ptr_writeback_ptr_);
+      }
+    }
     read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
 
     // TODO(benvanik): use reader->Read_update_freq_ and only issue after moving
@@ -320,7 +398,12 @@ bool CommandProcessor::SetupContext() {
 void CommandProcessor::ShutdownContext() {}
 
 void CommandProcessor::InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) {
+  // A (re)initialized ring starts empty: both pointers go to 0, as on the hardware.
+  // Skylanders: Spyro's Adventure re-creates its ring several times during boot
+  // (0x8000 and 0x20000 bytes). Keeping the old write pointer made the CP run
+  // stale commands across the new ring (a 0BADF00D "packet", then a hung fence wait).
   read_ptr_index_ = 0;
+  write_ptr_index_ = 0;
   primary_buffer_ptr_ = ptr;
   primary_buffer_size_ = uint32_t(1) << (size_log2 + 3);
 }
@@ -681,6 +764,13 @@ bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
     REXGPU_WARN("GPU packet is CDCDCDCD - probably read uninitialized memory!");
   }
 
+  // D3D filler (Skylanders: Spyro's Adventure leaves it in the primary ring
+  // before a wrap). Read as a type-0 header it claims 0xBAE registers, which
+  // overflows the ring and stopped all GPU work. Xenia skips it the same way.
+  if (packet == 0x0BADF00D) {
+    return true;
+  }
+
   switch (packet_type) {
     case 0x00:
       return ExecutePacketType0(reader, packet);
@@ -705,6 +795,21 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
   if (reader->read_count() < count * sizeof(uint32_t)) {
     REXGPU_ERROR("ExecutePacketType0 overflow (read count {:08X}, packet count {:08X})",
                  reader->read_count(), count * sizeof(uint32_t));
+    // Diagnostic: the packet, where it sits, and the dwords around it.
+    {
+      const uint8_t* buf = reader->buffer();
+      uint32_t cap = static_cast<uint32_t>(reader->capacity());
+      uint32_t at = (static_cast<uint32_t>(reader->read_offset()) + cap - 4) % cap;
+      std::string dump;
+      for (int i = -24; i < 16; ++i) {
+        uint32_t off = (at + cap + static_cast<uint32_t>(i * 4)) % cap;
+        uint32_t v = rex::byte_swap(*reinterpret_cast<const uint32_t*>(buf + off));
+        dump += fmt::format("{}{:08X}", i == 0 ? " [" : " ", v);
+        if (i == 0) dump += "]";
+      }
+      REXGPU_ERROR("  packet {:08X} at ring offset {:X} of {:X} (base host {}):{}", packet, at, cap,
+                   fmt::ptr(buf), dump);
+    }
     return false;
   }
 
@@ -972,9 +1077,19 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
     static clock::time_point window_start = clock::now(), last = clock::now();
     static uint32_t frames = 0;
     static double worst_ms = 0;
+    static uint64_t last_vblank = 0;
     clock::time_point now = clock::now();
     double ms = std::chrono::duration<double, std::milli>(now - last).count();
     last = now;
+    uint64_t vblank = g_guest_vblank_count.load(std::memory_order_relaxed);
+    uint64_t vblanks = vblank - last_vblank;
+    last_vblank = vblank;
+    if (ms > 40.0) {
+      // Frame-pacing trace: which frame in the window ran long, and how many guest vblanks passed.
+      REXGPU_INFO("fpslog long frame {:.2f} ms, frame {} of window at {:.0f} ms, guest vblanks {}",
+                  ms, frames, std::chrono::duration<double, std::milli>(now - window_start).count(),
+                  vblanks);
+    }
     worst_ms = std::max(worst_ms, ms);
     ++frames;
     double window = std::chrono::duration<double>(now - window_start).count();
@@ -1027,6 +1142,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
 
   bool matched = false;
   bool spin_started = false;
+  long long stuck_wait_logged_secs_ = 0;
   std::chrono::steady_clock::time_point spin_start;
   do {
     uint32_t value = 0;
@@ -1100,6 +1216,18 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         }
         rex::thread::SyncMemory();
         ReturnFromWait();
+
+        // Diagnostic: name a wait that has blocked for over a second (once per second).
+        {
+          auto waited = std::chrono::steady_clock::now() - spin_start;
+          auto secs = std::chrono::duration_cast<std::chrono::seconds>(waited).count();
+          if (secs >= 1 && secs != stuck_wait_logged_secs_) {
+            stuck_wait_logged_secs_ = secs;
+            REXGPU_WARN(
+                "WAIT_REG_MEM blocked {} s: {} {:08X} value {:08X} & {:08X} func {} ref {:08X}",
+                secs, is_memory ? "mem" : "reg", poll_reg_addr, value, mask, wait_info & 7, ref);
+          }
+        }
 
         if (!worker_running_) {
           // Short-circuited exit.

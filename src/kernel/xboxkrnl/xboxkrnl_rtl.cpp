@@ -79,6 +79,11 @@ void RtlFillMemoryUlong_entry(mapped_void destination, u32 length, u32 pattern) 
 
   uint32_t* p = destination.as<uint32_t*>();
   uint32_t swapped_pattern = rex::byte_swap(pattern);
+  // Diagnostic (Skylanders shadow square): fills around the 1x1 placeholder texture.
+  if (((destination.guest_address() & 0x1FFFFFFF) >> 20) == 0x1C6) {
+    REXKRNL_INFO("pdiag: RtlFillMemoryUlong {:08X} len {:#x} pattern {:08X}",
+                 destination.guest_address(), (uint32_t)length, (uint32_t)pattern);
+  }
   for (uint32_t n = 0; n < count; n++, p++) {
     *p = swapped_pattern;
   }

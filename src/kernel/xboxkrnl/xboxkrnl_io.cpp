@@ -29,6 +29,10 @@
 #include <rex/system/xtypes.h>
 #include <rex/thread/mutex.h>
 
+#include <atomic>
+#include <mutex>
+#include <unordered_map>
+
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
 
@@ -172,8 +176,34 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
     REXKRNL_IMPORT_FAIL("NtCreateFile", "path='{}' -> {:#x}", target_path, result);
   } else {
     REXKRNL_IMPORT_RESULT("NtCreateFile", "{:#x} handle={:#x}", result, handle);
+    // Diagnostic (Skylanders VO streaming): name every file the game opens.
+    static std::atomic<int> opens_logged{0};
+    if (opens_logged.fetch_add(1) < 600) {
+      REXKRNL_INFO("io: open '{}' -> handle {:#x} sync={} options={:#x} access={:#x}", target_path,
+                   handle, file->is_synchronous(), (uint32_t)create_options,
+                   (uint32_t)desired_access);
+    }
   }
   return result;
+}
+
+// Diagnostic: the first reads on each file (keyed by path; handle numbers get reused), then every
+// 32nd.
+static void LogRead(const char* what, const std::string& path, uint32_t handle, uint64_t offset,
+                    uint32_t len, uint32_t result, uint32_t got, bool apc, uint32_t event) {
+  static std::mutex m;
+  static std::unordered_map<std::string, uint32_t> counts;
+  uint32_t n;
+  {
+    std::lock_guard<std::mutex> g(m);
+    n = ++counts[path];
+  }
+  const bool is_pck = path.size() > 4 && path.compare(path.size() - 4, 4, ".pck") == 0;
+  if (n <= 8 || (n & 31) == 0 || (is_pck && n <= 4000)) {
+    REXKRNL_INFO(
+        "io: {} #{} '{}' handle {:#x} off {:#x} len {:#x} -> {:#x} got {:#x} apc={} event={:#x}",
+        what, n, path, handle, offset, len, result, got, apc, event);
+  }
 }
 
 u32 NtOpenFile_entry(mapped_u32 handle_out, u32 desired_access,
@@ -279,6 +309,10 @@ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_
     ev->Set(0, false);
   }
 
+  LogRead("read", file ? file->path() : std::string(), (uint32_t)file_handle, byte_offset, (uint32_t)buffer_length, result,
+          io_status_block ? (uint32_t)io_status_block->information : 0, apc_requested,
+          (uint32_t)event_handle);
+
   // Log detailed completion info for debugging async IO issues
   if (file) {
     REXKRNL_IMPORT_RESULT(
@@ -375,6 +409,11 @@ u32 NtReadFileScatter_entry(u32 file_handle, u32 event_handle, mapped_void apc_r
   if (ev && signal_event) {
     ev->Set(0, false);
   }
+
+  LogRead("scatter", file ? file->path() : std::string(), (uint32_t)file_handle,
+          byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : ~0ull, (uint32_t)length,
+          result, io_status_block ? (uint32_t)io_status_block->information : 0,
+          ((uint32_t)apc_routine_ptr & ~1u) != 0, (uint32_t)event_handle);
 
   return result;
 }

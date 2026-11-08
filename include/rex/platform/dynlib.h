@@ -31,6 +31,10 @@ class DynamicLibrary {
   DynamicLibrary& operator=(DynamicLibrary&& other) noexcept;
 
   bool Load(const std::filesystem::path& path, SymbolResolution mode = SymbolResolution::kLazy);
+  // Takes a reference to the library only if it is already loaded in the process; never
+  // loads it (RTLD_NOLOAD on POSIX, GetModuleHandleEx on Windows). For attach-only
+  // integrations such as RenderDoc, whose library hooks the graphics API once loaded.
+  bool LoadIfResident(const std::filesystem::path& path);
   void Close();
   explicit operator bool() const { return handle_ != nullptr; }
 

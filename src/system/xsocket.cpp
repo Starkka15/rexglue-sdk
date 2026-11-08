@@ -12,6 +12,7 @@
 #include <cstring>
 
 #include <rex/kernel/xam/module.h>
+#include <rex/logging.h>
 #include <rex/platform.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xsocket.h>
@@ -111,6 +112,24 @@ X_STATUS XSocket::Connect(N_XSOCKADDR* name, int name_len) {
 
 X_STATUS XSocket::Bind(N_XSOCKADDR_IN* name, int name_len) {
   int ret = bind(native_handle_, (sockaddr*)name, name_len);
+  uint16_t port = name->sin_port;
+  if (ret < 0 && port != 0 && port < 1024) {
+    // Titles bind fixed low ports (system link/VDP, e.g. 1000). A normal user
+    // can't bind below 1024 on Linux, and that includes Windows builds under
+    // Wine/Proton (Steam Deck, ROG Ally on SteamOS). A failed bind there left
+    // a title polling recvfrom on an unbound socket, which blocks forever on
+    // Wine, so the game never drew a frame. Fall back to port + 10000, then to
+    // any free port; nothing local depends on the exact number.
+    N_XSOCKADDR_IN alt = *name;
+    alt.sin_port = uint16_t(port + 10000);
+    ret = bind(native_handle_, (sockaddr*)&alt, name_len);
+    if (ret < 0) {
+      alt.sin_port = 0;
+      ret = bind(native_handle_, (sockaddr*)&alt, name_len);
+    }
+    REXKRNL_WARN("XSocket: bind to port {} refused, bound port {} instead ({})", port,
+                 uint16_t(alt.sin_port), ret < 0 ? "failed" : "ok");
+  }
   if (ret < 0) {
     return X_STATUS_UNSUCCESSFUL;
   }

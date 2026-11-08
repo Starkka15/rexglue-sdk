@@ -1449,6 +1449,14 @@ void XHostThread::Execute() {
   // Let the kernel know we are starting.
   kernel_state_->OnThreadExecute(this);
 
+  // Host threads run guest code too (GPU/vblank interrupt callbacks, audio callbacks). Seed
+  // the cached FPSCR from the host MXCSR with exceptions masked, as XThread::Execute does:
+  // left at 0, the first guest flush-mode switch wrote MXCSR = FTZ|DAZ with every FP
+  // exception unmasked, and a later inexact result killed the process (0xC000008F).
+  if (thread_state_) {
+    thread_state_->context()->fpscr.InitHost();
+  }
+
   int ret = host_fn_();
 
   // Exit.

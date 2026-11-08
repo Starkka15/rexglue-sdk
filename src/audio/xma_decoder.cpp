@@ -213,6 +213,7 @@ uint32_t XmaDecoder::AllocateContext() {
   XmaContext& context = contexts_[index];
   assert_false(context.is_allocated());
   context.set_is_allocated(true);
+  REXAPU_INFO("xmastate: alloc ctx {}", index);  // Diagnostic (Skylanders VO)
   return context.guest_ptr();
 }
 
@@ -222,6 +223,7 @@ void XmaDecoder::ReleaseContext(uint32_t guest_ptr) {
 
   XmaContext& context = contexts_[context_id];
   assert_true(context.is_allocated());
+  REXAPU_INFO("xmastate: release ctx {}", context_id);  // Diagnostic (Skylanders VO)
   context.Release();
   context_bitmap_.Release(context_id);
 }

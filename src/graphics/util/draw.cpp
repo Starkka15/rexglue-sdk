@@ -11,6 +11,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <mutex>
+#include <set>
+#include <tuple>
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
@@ -1106,6 +1109,35 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
                : xenos::GetColorRenderTargetFormatName(
                      xenos::ColorRenderTargetFormat(color_edram_info.format)),
       dest_format_info.name, rb_copy_dest_base, copy_dest_extent_start, copy_dest_extent_end);
+
+  // Diagnostic (Skylanders shadow square): each distinct resolve once, with its clears.
+  {
+    static std::mutex rdiag_mutex;
+    static std::set<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>> rdiag_seen;
+    std::lock_guard<std::mutex> rdiag_lock(rdiag_mutex);
+    uint32_t src_fmt = is_depth ? depth_edram_info.format : color_edram_info.format;
+    uint32_t clears = (uint32_t(rb_copy_control.depth_clear_enable) << 1) |
+                      uint32_t(rb_copy_control.color_clear_enable);
+    if (rdiag_seen.size() < 600 &&
+        rdiag_seen.emplace((is_depth ? 0x100u : 0u) | src_fmt, uint32_t(dest_format),
+                           (uint32_t(x1 - x0) << 16) | uint32_t(y1 - y0), rb_copy_dest_base, clears)
+            .second) {
+      REXGPU_INFO(
+          "rdiag: {} {} -> {} {}x{} at ({},{}) dest {:08X} array {} msaa {} sel {} "
+          "clear d{} c{} depthclr {:08X} colclr {:08X}{:08X} exp {} depthfmt {}",
+          is_depth ? "DEPTH" : "color",
+          is_depth ? xenos::GetDepthRenderTargetFormatName(
+                         xenos::DepthRenderTargetFormat(depth_edram_info.format))
+                   : xenos::GetColorRenderTargetFormatName(
+                         xenos::ColorRenderTargetFormat(color_edram_info.format)),
+          dest_format_info.name, x1 - x0, y1 - y0, x0, y0, rb_copy_dest_base,
+          uint32_t(rb_copy_dest_info.copy_dest_array), 1u << uint32_t(rb_surface_info.msaa_samples),
+          uint32_t(rb_copy_control.copy_sample_select), uint32_t(rb_copy_control.depth_clear_enable),
+          uint32_t(rb_copy_control.color_clear_enable), info_out.rb_depth_clear,
+          info_out.rb_color_clear, info_out.rb_color_clear_lo, exp_bias,
+          uint32_t(regs.Get<reg::RB_DEPTH_INFO>().depth_format));
+    }
+  }
 
   return true;
 }

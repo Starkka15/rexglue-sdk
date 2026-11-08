@@ -12,7 +12,9 @@
 #include <rex/graphics/graphics_system.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -59,6 +61,18 @@ rex::graphics::CommandProcessor::SwapPostEffect ParseSwapPostEffect(
 }  // namespace
 
 namespace rex::graphics {
+
+// Guest vblanks fired so far (read by the fps_log frame-pacing trace).
+std::atomic<uint64_t> g_guest_vblank_count{0};
+// Host time of the last guest vblank and the vblank period, for the scanline counter.
+static std::atomic<int64_t> g_last_vblank_ns{0};
+static std::atomic<int64_t> g_vblank_period_ns{0};
+
+static int64_t SteadyNowNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
 
 // Nvidia Optimus/AMD PowerXpress support.
 // These exports force the process to trigger the discrete GPU in multi-GPU
@@ -157,6 +171,10 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
         uint64_t vsync_interval_ticks =
             std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
         uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
+        // Host-time length of one guest frame (guest time may be scaled).
+        g_vblank_period_ns.store(
+            int64_t(1e9 / refresh_rate_hz / std::max(0.01, chrono::Clock::guest_time_scalar())),
+            std::memory_order_relaxed);
         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
         while (vsync_worker_running_) {
           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
@@ -240,7 +258,21 @@ uint32_t GraphicsSystem::ReadRegister(uint32_t addr) {
     case 0x194C: {  // R500_D1MODE_V_COUNTER
       system::X_VIDEO_MODE video_mode;
       kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
-      return std::min(uint32_t(video_mode.display_height), uint32_t(0x0FFF));
+      uint32_t height = std::min(uint32_t(video_mode.display_height), uint32_t(0x0FFF));
+      // The scanline being sent out: 0 at the vblank, the bottom line just before the next one.
+      // XDK D3D reads this when a swap comes in after its vblank: early in the frame it flips at
+      // once, otherwise it waits a whole extra vblank. Always answering the bottom line made every
+      // slightly late frame wait (33 ms frames turned into 50 ms ones about once a second).
+      int64_t period = g_vblank_period_ns.load(std::memory_order_relaxed);
+      int64_t last = g_last_vblank_ns.load(std::memory_order_relaxed);
+      if (period <= 0 || last == 0) {
+        return height;
+      }
+      int64_t since = std::max<int64_t>(0, SteadyNowNs() - last);
+      if (since >= period) {
+        return height;
+      }
+      return uint32_t(uint64_t(since) * height / uint64_t(period));
     }
     case 0x1951:    // interrupt status
       return 1;     // vblank
@@ -319,6 +351,8 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
 void GraphicsSystem::MarkVblank() {
   // TODO: Enable profiling once ported
   // SCOPE_profile_cpu_f("gpu");
+  g_guest_vblank_count.fetch_add(1, std::memory_order_relaxed);
+  g_last_vblank_ns.store(SteadyNowNs(), std::memory_order_relaxed);
 
   // Increment vblank counter (so the game sees us making progress).
   if (command_processor_) {

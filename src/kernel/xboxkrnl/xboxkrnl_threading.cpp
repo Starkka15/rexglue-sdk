@@ -16,9 +16,12 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <mutex>
+#include <unordered_map>
 #include <vector>
 
 #include <rex/chrono/clock.h>
+#include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/kernel/xboxkrnl/threading.h>
@@ -706,7 +709,63 @@ u32 NtCreateMutant_entry(mapped_u32 handle_out, ppc_ptr_t<X_OBJECT_ATTRIBUTES> o
   return X_STATUS_SUCCESS;
 }
 
+// Diagnostic: per-handle wait/release statistics, logged every 2 s (cvar wait_stats).
+REXCVAR_DEFINE_BOOL(wait_stats, false, "Kernel",
+                    "Log per-handle wait counts/times every 2 s and every wait over 20 ms");
+namespace {
+struct WaitStat {
+  uint64_t waits = 0, wait_us = 0, max_us = 0, releases = 0;
+  uint32_t last_tid = 0;
+  int type = 0;
+};
+std::mutex wait_stats_mutex_;
+std::unordered_map<uint32_t, WaitStat> wait_stats_;
+std::chrono::steady_clock::time_point wait_stats_last_ = std::chrono::steady_clock::now();
+
+void WaitStatsFlushLocked() {
+  auto now = std::chrono::steady_clock::now();
+  if (now - wait_stats_last_ < std::chrono::seconds(2)) return;
+  wait_stats_last_ = now;
+  std::vector<std::pair<uint32_t, WaitStat>> v(wait_stats_.begin(), wait_stats_.end());
+  std::sort(v.begin(), v.end(), [](auto& a, auto& b) {
+    return a.second.wait_us + a.second.releases > b.second.wait_us + b.second.releases;
+  });
+  for (size_t i = 0; i < v.size() && i < 6; ++i) {
+    auto& s = v[i].second;
+    REXKRNL_INFO("waitstats: h {:08X} type {} waits {} wait_ms {} max_ms {} releases {} tid {:X}",
+                 v[i].first, s.type, s.waits, s.wait_us / 1000, s.max_us / 1000, s.releases,
+                 s.last_tid);
+  }
+  wait_stats_.clear();
+}
+
+void WaitStatsRecord(uint32_t handle, XObject* obj, uint64_t us) {
+  uint32_t tid = XThread::IsInThread() ? XThread::GetCurrentThreadId() : 0;
+  if (us > 20000) {
+    REXKRNL_INFO("waitstats: long wait {} ms on h {:08X} type {} tid {:X}", us / 1000, handle,
+                 obj ? int(obj->type()) : -1, tid);
+  }
+  std::lock_guard<std::mutex> lock(wait_stats_mutex_);
+  auto& s = wait_stats_[handle];
+  s.waits++;
+  s.wait_us += us;
+  s.max_us = std::max(s.max_us, us);
+  s.last_tid = tid;
+  if (obj) s.type = int(obj->type());
+  WaitStatsFlushLocked();
+}
+
+void WaitStatsRelease(uint32_t handle) {
+  std::lock_guard<std::mutex> lock(wait_stats_mutex_);
+  auto& s = wait_stats_[handle];
+  s.releases++;
+  s.type = int(XObject::Type::Mutant);
+  WaitStatsFlushLocked();
+}
+}  // namespace
+
 u32 NtReleaseMutant_entry(u32 mutant_handle, u32 unknown) {
+  if (REXCVAR_GET(wait_stats)) WaitStatsRelease(mutant_handle);
   // This doesn't seem to be supported.
   // int32_t previous_count_ptr = SHIM_GET_ARG_32(2);
 
@@ -857,7 +916,14 @@ u32 NtWaitForSingleObjectEx_entry(u32 object_handle, u32 wait_mode, u32 alertabl
   auto object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(object_handle);
   if (object) {
     uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
+    auto t0 = std::chrono::steady_clock::now();
     result = object->Wait(3, wait_mode, alertable, timeout_ptr ? &timeout : nullptr);
+    if (REXCVAR_GET(wait_stats)) {
+      WaitStatsRecord(object_handle, object.get(),
+                      uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                   std::chrono::steady_clock::now() - t0)
+                                   .count()));
+    }
     if (alertable && result == X_STATUS_USER_APC) {
       XThread::GetCurrentThread()->DeliverAPCs();
     }

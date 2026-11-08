@@ -4391,7 +4391,7 @@ bool VulkanCommandProcessor::IssueCopy() {
   }
 
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
-  if (readback_mode == ReadbackResolveMode::kDisabled) {
+  if (readback_mode == ReadbackResolveMode::kDisabled && !HasReadbackResolveAddresses()) {
     uint32_t written_address, written_length;
     return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
                                          written_address, written_length);
@@ -4419,7 +4419,9 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
     return true;
   }
 
-  ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
+  ReadbackResolveMode readback_mode = GetReadbackResolveModeFor(
+      GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve)), written_address,
+      written_length);
   if (readback_mode == ReadbackResolveMode::kDisabled) {
     return true;
   }
